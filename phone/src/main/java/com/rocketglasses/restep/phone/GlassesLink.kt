@@ -24,25 +24,26 @@ class GlassesLink(private val context: Context, private val status: (String)->Un
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var active = false
     private var found = false
-    private val timeout = Runnable { if(active) { stop(); status("Connection timed out. Open Sync on the glasses and try again.") } }
+    private val timeout = Runnable { if(active) { stop(); status("接続がタイムアウトしました。グラスを同期画面にして、もう一度試すか「手動で接続」を使ってください。") } }
+    private val hint = Runnable { if(active && !found) status("グラスがまだ見つかりません。グラスが同期画面か確認するか、「手動で接続」を使ってください。") }
     private val scan = object: ScanCallback() {
         override fun onScanResult(type: Int, result: ScanResult) { handler.post {
             if(!active || found) return@post
             found = true; adapter.bluetoothLeScanner.stopScan(this)
-            status("Pair with your glasses when Android asks…")
+            status("グラスが見つかりました。Android の確認が出たらペアリングを許可してください…")
             gatt = result.device.connectGatt(context, false, callbacks, BluetoothDevice.TRANSPORT_LE)
         } }
-        override fun onScanFailed(errorCode: Int) { handler.post { stop(); status("Bluetooth scan failed ($errorCode). Try again.") } }
+        override fun onScanFailed(errorCode: Int) { handler.post { stop(); status("Bluetooth の検索に失敗しました（$errorCode）。もう一度お試しください。") } }
     }
     private val callbacks = object: BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, code: Int, state: Int) {
             if(state == BluetoothProfile.STATE_CONNECTED && code == 0) g.discoverServices()
-            else if(state == BluetoothProfile.STATE_DISCONNECTED) handler.post { if(active && networkCallback == null) { stop(); status("Glasses disconnected. Please retry.") } }
+            else if(state == BluetoothProfile.STATE_DISCONNECTED) handler.post { if(active && networkCallback == null) { stop(); status("グラスとの接続が切れました。もう一度お試しください。") } }
         }
         override fun onServicesDiscovered(g: BluetoothGatt, code: Int) {
             val ch = g.getService(service)?.getCharacteristic(info)
             if(code == 0 && ch != null) g.readCharacteristic(ch)
-            else handler.post { stop(); status("ReStep sync service was not found.") }
+            else handler.post { stop(); status("グラスに ReStep の同期サービスが見つかりません。") }
         }
         @Deprecated("Legacy Android callback")
         override fun onCharacteristicRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic, code: Int) {
@@ -52,42 +53,54 @@ class GlassesLink(private val context: Context, private val status: (String)->Un
     }
     private fun received(g: BluetoothGatt, bytes: ByteArray, code: Int) { handler.post {
         if(!active || g !== gatt) return@post
-        if(code != BluetoothGatt.GATT_SUCCESS) { stop(); status("Pairing was not completed. Pair in Bluetooth settings, then retry."); return@post }
+        if(code != BluetoothGatt.GATT_SUCCESS) { stop(); status("ペアリングが完了しませんでした。Bluetooth 設定でペアリングしてから再試行するか、「手動で接続」を使ってください。"); return@post }
         try {
             val value = JSONObject(bytes.toString(Charsets.UTF_8))
             validate(value)
-            status("Approve the ReStep Wi-Fi connection…")
+            status("ReStep の Wi-Fi 接続を許可してください…")
             val spec = WifiNetworkSpecifier.Builder().setSsid(value.getString("ssid")).setWpa2Passphrase(value.getString("password")).build()
             val callback = object: ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) { handler.post { if(active) { handler.removeCallbacks(timeout); ready(network, value) } } }
-                override fun onUnavailable() { handler.post { stop(); status("Wi-Fi connection declined or unavailable. Please retry.") } }
-                override fun onLost(network: Network) { handler.post { if(active) { stop(); status("Glasses Wi-Fi disconnected.") } } }
+                override fun onUnavailable() { handler.post { stop(); status("Wi-Fi 接続が許可されなかったか、つながりませんでした。もう一度お試しください。") } }
+                override fun onLost(network: Network) { handler.post { if(active) { stop(); status("グラスの Wi-Fi が切れました。") } } }
             }
             networkCallback = callback
             cm.requestNetwork(NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
                 .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).setNetworkSpecifier(spec).build(), callback)
-        } catch(e: Exception) { stop(); status(e.message ?: "Cannot connect") }
+        } catch(e: Exception) { stop(); status(e.message ?: "接続できません") }
     } }
+    /** 手動で Wi-Fi につないだとき、同じネットワーク（IPの上位3桁が同じ Wi-Fi）を探す。見つからなければ null。 */
+    fun wifiNetworkFor(host: String): Network? {
+        val prefix = host.split('.').take(3)
+        return cm.allNetworks.firstOrNull { network ->
+            cm.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                cm.getLinkProperties(network)?.linkAddresses?.any {
+                    (it.address as? java.net.Inet4Address)?.hostAddress?.split('.')?.take(3) == prefix
+                } == true
+        }
+    }
+
     fun start() {
         stop()
-        check(adapter != null && adapter.isEnabled) { "Enable Bluetooth and Wi-Fi first." }
+        check(adapter != null && adapter.isEnabled) { "先に Bluetooth と Wi-Fi をオンにしてください。" }
         active = true; found = false
         adapter.bluetoothLeScanner.startScan(listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(service)).build()),
             ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), scan)
         handler.postDelayed(timeout, 90000)
-        status("Looking for ReStep… Swipe back on the glasses to open Sync.")
+        handler.postDelayed(hint, 15000)
+        status("グラスを探しています…（グラスで後ろへスワイプして同期画面を開いてください）")
     }
     fun stop() {
-        active = false; handler.removeCallbacks(timeout)
+        active = false; handler.removeCallbacks(timeout); handler.removeCallbacks(hint)
         runCatching { adapter?.bluetoothLeScanner?.stopScan(scan) }
         gatt?.close(); gatt = null
         networkCallback?.let { runCatching { cm.unregisterNetworkCallback(it) } }; networkCallback = null
     }
     companion object {
         fun validate(value: JSONObject) {
-            require(value.getInt("version") == 1 && value.getString("ssid").startsWith("DIRECT-RS-ReStep-")) { "Invalid ReStep connection" }
+            require(value.getInt("version") == 1 && value.getString("ssid").startsWith("DIRECT-RS-ReStep-")) { "ReStep の接続情報が正しくありません" }
             val parts = value.getString("host").split('.').map { it.toIntOrNull() ?: -1 }
-            require(parts.size == 4 && parts.all { it in 0..255 } && (parts[0] == 10 || parts[0] == 192 && parts[1] == 168 || parts[0] == 172 && parts[1] in 16..31)) { "Invalid local address" }
+            require(parts.size == 4 && parts.all { it in 0..255 } && (parts[0] == 10 || parts[0] == 192 && parts[1] == 168 || parts[0] == 172 && parts[1] in 16..31)) { "接続先のアドレスが正しくありません" }
             require(value.getInt("port") == 8765)
             UUID.fromString(value.getString("token"))
         }
@@ -99,10 +112,10 @@ class GlassesLink(private val context: Context, private val status: (String)->Un
                 connection.instanceFollowRedirects = false; connection.requestMethod = method
                 connection.setRequestProperty("X-Pair-Code", token)
                 val code = connection.responseCode
-                check(code in 200..299) { when(code) { 403 -> "Pairing expired. Reconnect to the glasses."; 409 -> "Save the current photo on the glasses before deleting."; else -> "Glasses returned HTTP $code" } }
+                check(code in 200..299) { when(code) { 403 -> "ペアコードが違うか期限切れです。グラスの表示を確認してください。"; 409 -> "削除の前に、グラスで現在の写真を保存してください。"; else -> "グラスがエラーを返しました（HTTP $code）" } }
                 return connection.inputStream.use { input ->
                     val out = java.io.ByteArrayOutputStream(); val buffer = ByteArray(8192)
-                    while(true) { val n = input.read(buffer); if(n < 0) break; check(out.size() + n <= 32 * 1024 * 1024) { "Response too large" }; out.write(buffer,0,n) }
+                    while(true) { val n = input.read(buffer); if(n < 0) break; check(out.size() + n <= 32 * 1024 * 1024) { "受信データが大きすぎます" }; out.write(buffer,0,n) }
                     out.toByteArray()
                 }
             } finally { connection.disconnect() }

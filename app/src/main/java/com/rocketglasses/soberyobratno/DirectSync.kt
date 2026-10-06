@@ -32,12 +32,19 @@ class DirectSync(private val context: Context, private val changed: () -> Unit) 
     private var generation = 0
     private val snapshots = mutableMapOf<String, ByteArray>()
     @Volatile var active = false; private set
+    /** スマホが Bluetooth でつながっている間は true。 */
+    @Volatile var bleConnected = false; private set
     @Volatile var token: String? = null; private set
-    var state = "OFF"; private set
+    var state = "オフ"; private set
     var ssid = prefs.getString("ssid", null) ?: "DIRECT-RS-ReStep-${UUID.randomUUID().toString().take(4)}"
         private set
-    private val password = prefs.getString("password", null) ?: UUID.randomUUID().toString().replace("-", "").take(20)
+    // 手で入力しやすいよう、数字8桁（Wi-Fi の最短の長さ）。以前の長い英数字のパスワードは作り直す。
+    private val password = prefs.getString("password", null)?.takeIf { it.matches(Regex("[0-9]{8}")) }
+        ?: (10000000 + java.security.SecureRandom().nextInt(90000000)).toString()
     private var host = ""
+    /** 手動で Wi-Fi 設定からつなぐときに画面へ表示する値。 */
+    val wifiPassword: String get() = password
+    val groupHost: String get() = host
 
     init { prefs.edit().putString("ssid", ssid).putString("password", password).apply() }
 
@@ -49,45 +56,52 @@ class DirectSync(private val context: Context, private val changed: () -> Unit) 
         val run = ++generation
         token = UUID.randomUUID().toString()
         host = ""
-        update("STARTING WI-FI")
+        update("Wi-Fiを起動中")
         try {
-            val adapter = context.getSystemService(BluetoothManager::class.java).adapter
-            if (adapter == null || !adapter.isEnabled) { fail("ENABLE BLUETOOTH"); return }
-            advertiser = adapter.bluetoothLeAdvertiser
-            if (advertiser == null) { fail("BLUETOOTH SHARING UNAVAILABLE"); return }
             channel = channel ?: manager.initialize(context, Looper.getMainLooper()) {
                 channel = null
-                if (active) fail("WI-FI CONNECTION LOST. RETRY")
+                if (active) fail("Wi-Fi接続が切れました。再試行してください")
             }
-            if (!wifi.isWifiEnabled) { fail("ENABLE WI-FI, THEN RETRY"); return }
+            if (!wifi.isWifiEnabled) { fail("Wi-Fiをオンにして再試行してください"); return }
             manager.requestGroupInfo(channel) { existing ->
                 if (run != generation || !active) return@requestGroupInfo
-                if (android.os.Build.VERSION.SDK_INT < 29) { fail("DIRECT SYNC NEEDS ANDROID 10"); return@requestGroupInfo }
+                if (android.os.Build.VERSION.SDK_INT < 29) { fail("直接同期にはAndroid 10以上が必要です"); return@requestGroupInfo }
                 if (existing != null) {
                     // The OS may retain our group after an APK update or process death.
-                    if (existing.isGroupOwner && existing.networkName == ssid) {
+                    if (existing.isGroupOwner && existing.networkName == ssid && existing.passphrase == password) {
                         ownedGroup = true
                         waitForAddress(run, 0)
-                    } else fail("CLOSE HI ROKID TRANSFER, RETRY")
+                    } else if (existing.isGroupOwner && existing.networkName == ssid) {
+                        // パスワードを変えたので、古いグループを閉じて作り直す。
+                        manager.removeGroup(channel, object : WifiP2pManager.ActionListener {
+                            override fun onSuccess() { handler.postDelayed({ createOwnGroup(run) }, 500) }
+                            override fun onFailure(reason: Int) { if (run == generation && active) fail("Wi-Fiの作り直しに失敗 ($reason)") }
+                        })
+                    } else fail("Hi Rokidの転送を閉じて再試行してください")
                     return@requestGroupInfo
                 }
-                val config = WifiP2pConfig.Builder().setNetworkName(ssid).setPassphrase(password)
-                    .setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_2GHZ).build()
-                manager.createGroup(channel!!, config, object : WifiP2pManager.ActionListener {
-                    override fun onSuccess() {
-                        if (run != generation || !active) {
-                            manager.removeGroup(channel, null)
-                            return
-                        }
-                        ownedGroup = true
-                        waitForAddress(run, 0)
-                    }
-                    override fun onFailure(reason: Int) {
-                        if (run == generation && active) fail("WI-FI START FAILED ($reason)")
-                    }
-                })
+                createOwnGroup(run)
             }
-        } catch (e: Exception) { fail("SYNC: ${e.message?.take(65) ?: "UNAVAILABLE"}") }
+        } catch (e: Exception) { fail("同期: ${e.message?.take(65) ?: "利用できません"}") }
+    }
+
+    private fun createOwnGroup(run: Int) {
+        if (run != generation || !active) return
+        val config = WifiP2pConfig.Builder().setNetworkName(ssid).setPassphrase(password)
+            .setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_2GHZ).build()
+        manager.createGroup(channel!!, config, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                if (run != generation || !active) {
+                    manager.removeGroup(channel, null)
+                    return
+                }
+                ownedGroup = true
+                waitForAddress(run, 0)
+            }
+            override fun onFailure(reason: Int) {
+                if (run == generation && active) fail("Wi-Fi起動に失敗 ($reason)")
+            }
+        })
     }
 
     private fun waitForAddress(run: Int, attempt: Int) {
@@ -96,14 +110,20 @@ class DirectSync(private val context: Context, private val changed: () -> Unit) 
             if (!active || run != generation) return@requestConnectionInfo
             if (info.groupFormed && info.isGroupOwner && info.groupOwnerAddress != null) {
                 host = info.groupOwnerAddress.hostAddress ?: ""
+                // Wi-Fi が使えれば、Bluetooth が失敗しても手動接続（SSID・パスワード・IP）は使えるように残す。
+                update("手動接続できます（自動接続を準備中）")
                 startBluetooth()
             } else if (attempt < 20) handler.postDelayed({ waitForAddress(run, attempt + 1) }, 500)
-            else fail("WI-FI TIMEOUT. RETRY")
+            else fail("Wi-Fiタイムアウト。再試行してください")
         }
     }
 
     private fun startBluetooth() {
         try {
+            val adapter = context.getSystemService(BluetoothManager::class.java).adapter
+            if (adapter == null || !adapter.isEnabled) { bluetoothUnavailable("Bluetoothがオフ。手動接続のみ"); return }
+            advertiser = adapter.bluetoothLeAdvertiser
+            if (advertiser == null) { bluetoothUnavailable("Bluetooth不可。手動接続のみ"); return }
             val service = BluetoothGattService(SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY)
             service.addCharacteristic(BluetoothGattCharacteristic(INFO,
                 BluetoothGattCharacteristic.PROPERTY_READ, BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED))
@@ -112,7 +132,7 @@ class DirectSync(private val context: Context, private val changed: () -> Unit) 
                     override fun onServiceAdded(status: Int, service: BluetoothGattService) {
                         handler.post {
                             if (!active || gatt == null) return@post
-                            if (status != BluetoothGatt.GATT_SUCCESS) { fail("BLUETOOTH SERVICE FAILED"); return@post }
+                            if (status != BluetoothGatt.GATT_SUCCESS) { bluetoothUnavailable("Bluetooth起動失敗。手動接続のみ"); return@post }
                             advertiser?.startAdvertising(AdvertiseSettings.Builder()
                                 .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
                                 .setConnectable(true).setTimeout(0).build(),
@@ -120,7 +140,8 @@ class DirectSync(private val context: Context, private val changed: () -> Unit) 
                         }
                     }
                     override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
-                        if (newState == BluetoothProfile.STATE_DISCONNECTED) synchronized(snapshots) { snapshots.remove(device.address) }
+                        if (newState == BluetoothProfile.STATE_CONNECTED) { bleConnected = true; handler.post { changed() } }
+                        if (newState == BluetoothProfile.STATE_DISCONNECTED) { bleConnected = false; synchronized(snapshots) { snapshots.remove(device.address) }; handler.post { changed() } }
                     }
                     override fun onCharacteristicReadRequest(device: BluetoothDevice, requestId: Int,
                         offset: Int, characteristic: BluetoothGattCharacteristic) {
@@ -139,13 +160,21 @@ class DirectSync(private val context: Context, private val changed: () -> Unit) 
                         } else gatt?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, bytes.copyOfRange(offset, bytes.size))
                     }
                 })
-            if (gatt?.addService(service) != true) fail("BLUETOOTH SERVICE UNAVAILABLE")
-        } catch (e: Exception) { fail("BLUETOOTH: ${e.message?.take(60)}") }
+            if (gatt?.addService(service) != true) bluetoothUnavailable("Bluetooth不可。手動接続のみ")
+        } catch (e: Exception) { bluetoothUnavailable("Bluetooth異常。手動接続のみ") }
     }
 
     private val advertising = object : AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings) { handler.post { if (active) update("READY FOR IPHONE") } }
-        override fun onStartFailure(errorCode: Int) { handler.post { if (active) fail("BLUETOOTH START FAILED ($errorCode)") } }
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings) { handler.post { if (active) update("スマホからの接続待ち") } }
+        override fun onStartFailure(errorCode: Int) { handler.post { if (active) bluetoothUnavailable("Bluetooth広告失敗($errorCode)。手動接続のみ") } }
+    }
+
+    /** Bluetooth が使えなくても Wi-Fi のグループは閉じず、手動接続だけは使えるようにする。 */
+    private fun bluetoothUnavailable(message: String) {
+        try { advertiser?.stopAdvertising(advertising) } catch (_: Exception) {}
+        try { gatt?.close() } catch (_: Exception) {}
+        gatt = null
+        update(message)
     }
 
     private fun fail(message: String) {
@@ -161,11 +190,12 @@ class DirectSync(private val context: Context, private val changed: () -> Unit) 
         advertiser = null
         try { gatt?.close() } catch (_: Exception) {}
         gatt = null
+        bleConnected = false
         synchronized(snapshots) { snapshots.clear() }
         if (ownedGroup) {
             try { manager.removeGroup(channel, null) } catch (_: Exception) {}
             ownedGroup = false
         }
-        update("OFF")
+        update("オフ")
     }
 }

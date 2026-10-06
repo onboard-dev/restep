@@ -29,7 +29,7 @@ class MainActivity : Activity() {
     private lateinit var server: TransferServer
     private lateinit var directSync: DirectSync
     private var pendingPhoto: ByteArray? = null
-    private var status = "READY"
+    private var status = "準備完了"
     private var syncPage = false
     private var capturing = false
     private var finishRequested = false
@@ -61,7 +61,8 @@ class MainActivity : Activity() {
         hud = Hud()
         directSync = DirectSync(this) { hud.invalidate() }
         server = TransferServer(store, pairCode, { directSync.token },
-            port = if (packageName.endsWith(".inputtest")) 8766 else 8765) { id ->
+            port = if (packageName.endsWith(".inputtest")) 8766 else 8765,
+            onSynced = { ids -> markSynced(ids) }) { id ->
             val completed = java.util.concurrent.CountDownLatch(1)
             var allowed = false
             var failure: Exception? = null
@@ -72,7 +73,7 @@ class MainActivity : Activity() {
                         store.deleteSession(id)
                         allowed = true
                         if (isCurrent) voice.cancelNote()
-                        setStatus("DISASSEMBLY DELETED FROM IPHONE")
+                        setStatus("スマホから記録を削除しました")
                         showMenu(false)
                     }
                 } catch (e: Exception) { failure = e }
@@ -85,7 +86,7 @@ class MainActivity : Activity() {
         setContentView(hud)
         voice = VoiceEngine(this,
             onCommand = { command -> runOnUiThread { handleCommand(command) } },
-            onNote = { note -> runOnUiThread { savePhoto(note) } },
+            onNote = { note, audio -> runOnUiThread { savePhoto(note, audio) } },
             onStatus = { message -> runOnUiThread { setStatus(message) } })
         ensurePermissions()
         debugIntent(intent)
@@ -120,14 +121,14 @@ class MainActivity : Activity() {
                 pendingPhoto = null
                 voice.cancelNote()
                 voice.mute(false)
-                setStatus("READY")
+                setStatus("準備完了")
                 showMenu()
             }
             "cameraSample" -> camera.take { result ->
                 result.onSuccess {
                     store.addCameraSample(it)
                     Log.i("MemoryCamera", "Camera sample saved: ${it.size} bytes")
-                    runOnUiThread { setStatus("CAMERA SAMPLE SAVED. SYNC TO IPHONE") }
+                    runOnUiThread { setStatus("カメラ見本を保存。スマホと同期してください") }
                 }.onFailure { Log.e("MemoryCamera", "Camera sample failed", it) }
             }
             "testCamera" -> camera.take { result ->
@@ -143,7 +144,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        try { server.start() } catch (e: Exception) { setStatus("SYNC: ${e.message}") }
+        try { server.start() } catch (e: Exception) { setStatus("同期: ${e.message}") }
         if (hasPermissions()) voice.start()
         if (syncPage && !directSync.active && wifi.isWifiEnabled &&
             syncPermissions().all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) directSync.start()
@@ -177,30 +178,29 @@ class MainActivity : Activity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 2) {
             if (syncPermissions().all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) directSync.start()
-            else setStatus("ALLOW NEARBY DEVICES AND LOCATION")
+            else setStatus("付近のデバイスと位置情報を許可してください")
             return
         }
-        if (hasPermissions()) voice.start() else setStatus("CAMERA AND MIC NEEDED")
+        if (hasPermissions()) voice.start() else setStatus("カメラとマイクの許可が必要です")
     }
 
     private fun handleCommand(command: String) {
         when (command) {
-            "сделать фото", "сделай фото", "сфотографировать",
-            "take photo", "take a photo", "capture photo" -> takePhoto()
+            VoiceEngine.COMMAND_PHOTO -> takePhoto()
         }
     }
 
     private fun takePhoto() {
-        if (store.current() == null) { setStatus("SWIPE FORWARD: NEW SESSION"); return }
+        if (store.current() == null) { setStatus("前スワイプ: 新しい記録"); return }
         if (!hasPermissions()) { ensurePermissions(); return }
-        if (pendingPhoto != null) { setStatus("SAY NOTE + SEND, OR TAP"); return }
+        if (pendingPhoto != null) { setStatus("説明を話して「送信」、またはタップ"); return }
         if (capturing) return
         directSync.stop()
         capturing = true
         syncPage = false
         showMenu(false)
         voice.mute(true)
-        setStatus("CAPTURING...")
+        setStatus("撮影中...")
         voice.suspendForCamera { released -> runOnUiThread {
             if (isDestroyed || isFinishing) return@runOnUiThread
             if (!released) {
@@ -208,7 +208,7 @@ class MainActivity : Activity() {
                 finishRequested = false; exitAfterFinish = false
                 voice.mute(false)
                 voice.resumeAfterCamera()
-                setStatus("PHOTO: SPEECH BUSY. PLEASE RETRY")
+                setStatus("写真: 音声処理中。もう一度どうぞ")
                 return@runOnUiThread
             }
             camera.take { result -> runOnUiThread {
@@ -217,47 +217,47 @@ class MainActivity : Activity() {
                 pendingPhoto = bytes
                 if (!finishRequested) voice.expectNote()
                 voice.mute(false)
-                setStatus("LOADING SPEECH. PLEASE WAIT")
+                setStatus("LOADING")
                 voice.resumeAfterCamera()
                 if (finishRequested) savePhoto("")
             }, { error ->
                 finishRequested = false; exitAfterFinish = false
                 voice.mute(false)
                 voice.resumeAfterCamera()
-                setStatus("PHOTO: ${error.message ?: "ERROR"}")
+                setStatus("写真: ${error.message ?: "エラー"}")
             })
             } }
         } }
     }
 
-    private fun savePhoto(note: String) {
+    private fun savePhoto(note: String, audio: ByteArray? = null) {
         val bytes = pendingPhoto ?: return
         try {
-            val step = store.addStep(bytes, note)
+            val step = store.addStep(bytes, note, audio)
             pendingPhoto = null
             voice.cancelNote()
             voice.mute(false)
-            setStatus("STEP ${step.getInt("number")} SAVED")
+            setStatus("手順 ${step.getInt("number")} を保存しました" + if (step.has("audio")) "（音声あり）" else "")
             if (finishRequested) completeSession() else showMenu()
         } catch (e: Exception) {
             finishRequested = false; exitAfterFinish = false
-            setStatus("SAVE: ${e.message}")
+            setStatus("保存: ${e.message}")
         }
     }
 
     private fun newSession() {
         if (capturing) return
-        if (pendingPhoto != null) { setStatus("SAVE THE PHOTO FIRST"); return }
+        if (pendingPhoto != null) { setStatus("先に写真を保存してください"); return }
         directSync.stop()
         if (store.current() != null) {
             syncPage = false
-            setStatus("CONTINUING. DOUBLE TAP: FINISH")
+            setStatus("記録を継続。ダブルタップで終了")
             showMenu()
             return
         }
         store.newSession()
         syncPage = false
-        setStatus("NEW DISASSEMBLY")
+        setStatus("新しい記録を開始")
         showMenu()
     }
 
@@ -266,16 +266,16 @@ class MainActivity : Activity() {
         Log.i("MemoryInput", "finish requested capturing=$capturing pending=${pendingPhoto != null} queued=$finishRequested active=${store.current() != null}")
         if (finishRequested) {
             exitAfterFinish = true
-            setStatus("FINISHING, THEN EXIT")
+            setStatus("終了処理後にアプリを閉じます")
             return
         }
         if (store.current() == null) { exitToHome(); return }
         finishRequested = true
         showMenu(false)
-        if (capturing) { setStatus("FINISHING AFTER PHOTO"); return }
+        if (capturing) { setStatus("撮影後に終了します"); return }
         if (pendingPhoto != null) {
-            setStatus("FINISHING: SAVING PHOTO + NOTE")
-            if (!voice.submitNote()) savePhoto(voice.currentDraft())
+            setStatus("終了中: 写真とメモを保存")
+            if (!voice.submitNote()) savePhoto(voice.currentDraft(), voice.takeAudio())
             return
         }
         completeSession()
@@ -286,13 +286,13 @@ class MainActivity : Activity() {
             store.finishSession()
             finishRequested = false
             syncPage = false
-            setStatus("FINISHED. DOUBLE TAP: EXIT")
+            setStatus("終了しました。ダブルタップで閉じる")
             showMenu(false)
             Log.i("MemoryInput", "Session finished; exit=$exitAfterFinish")
             if (exitAfterFinish) exitToHome()
         } catch (e: Exception) {
             finishRequested = false; exitAfterFinish = false
-            setStatus("SAVE: ${e.message}")
+            setStatus("保存: ${e.message}")
         }
     }
 
@@ -314,16 +314,21 @@ class MainActivity : Activity() {
 
     private fun setStatus(value: String) {
         status = value
-        if (value.startsWith("PHOTO:") || value.startsWith("SAVE:") || value.startsWith("SPEECH:"))
+        if (isError(value))
             showMenu(false)
         hud.invalidate()
     }
+
+    private fun isLoading() = status == "LOADING" || status.startsWith("音声認識を読み込み")
+
+    private fun isError(value: String) =
+        value.startsWith("写真:") || value.startsWith("保存:") || value.startsWith("音声:")
 
     private fun openWifiSettings() {
         try {
             startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
         } catch (_: Exception) {
-            setStatus("OPEN WI-FI IN GLASSES SETTINGS")
+            setStatus("グラスの設定でWi-Fiを開いてください")
         }
     }
 
@@ -338,7 +343,7 @@ class MainActivity : Activity() {
     }.toTypedArray()
 
     private fun openDirectSync() {
-        if (pendingPhoto != null || capturing) { setStatus("SAVE THE PHOTO FIRST"); return }
+        if (pendingPhoto != null || capturing) { setStatus("先に写真を保存してください"); return }
         syncPage = true
         showMenu(false)
         if (!wifi.isWifiEnabled) { openWifiSettings(); return }
@@ -399,8 +404,7 @@ class MainActivity : Activity() {
                     lastSwipeAt = now
                     lastSwipeDirection = direction
                     if (direction > 0) {
-                        if (syncPage) { voice.switchLanguage(); hud.invalidate() }
-                        else newSession()
+                        if (!syncPage) newSession()
                     } else { openDirectSync() }
                 }
             }
@@ -420,8 +424,8 @@ class MainActivity : Activity() {
                         else { directSync.stop(); syncPage = false; showMenu() }
                     }
                     else if (pendingPhoto != null) {
-                        if (voice.submitNote()) setStatus("SAVING PHOTO + NOTE")
-                        else savePhoto(voice.currentDraft())
+                        if (voice.submitNote()) setStatus("写真とメモを保存中")
+                        else savePhoto(voice.currentDraft(), voice.takeAudio())
                     } else takePhoto()
                 }
                 return true
@@ -443,109 +447,133 @@ class MainActivity : Activity() {
         } catch (_: Exception) { null }
     }
 
+    // スマホが保存を確認した手順の ID（「未同期の手順」の数に使う）。
+    private val syncedPrefs by lazy { getSharedPreferences("synced-steps", MODE_PRIVATE) }
+    private fun markSynced(ids: List<String>) = synchronized(syncedPrefs) {
+        val all = (syncedPrefs.getStringSet("ids", emptySet()) ?: emptySet()).toMutableSet()
+        if (all.addAll(ids)) syncedPrefs.edit().putStringSet("ids", all).apply()
+        hud.postInvalidate()
+    }
+    private fun unsyncedCount(): Int = synchronized(syncedPrefs) {
+        val synced = syncedPrefs.getStringSet("ids", emptySet()) ?: emptySet()
+        val sessions = store.sessions()
+        var count = 0
+        for (i in 0 until sessions.length()) {
+            val steps = sessions.getJSONObject(i).getJSONArray("steps")
+            for (j in 0 until steps.length()) if (steps.getJSONObject(j).getString("id") !in synced) count++
+        }
+        count
+    }
+
+    private companion object { const val NOTE_LINE = 22 } // 全角文字が読める大きさで1行に収まる文字数
+
     private inner class Hud : View(this@MainActivity) {
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+        // 日本語の字形で描く（指定しないと「写」などが中国語（簡体字）の字形になる）。
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textLocale = java.util.Locale.JAPAN }
         private fun line(canvas: Canvas, text: String, y: Float, size: Float = 22f) {
             paint.textSize = size
             val textWidth = paint.measureText(text)
             if (textWidth > 436f) paint.textSize = size * 436f / textWidth
             canvas.drawText(text, 22f, y, paint)
         }
+        private fun title(canvas: Canvas, text: String) {
+            line(canvas, text, 44f, 30f)
+            paint.strokeWidth = 2f
+            canvas.drawLine(20f, 58f, 460f, 58f, paint)
+        }
         override fun onDraw(canvas: Canvas) {
             canvas.drawColor(Color.BLACK)
             val sx = width / 480f; val sy = height / 640f
             canvas.save(); canvas.scale(sx, sy)
             if (quietMode && !syncPage && !capturing && pendingPhoto == null) {
-                line(canvas, "WAITING / ОЖИДАНИЕ", 565f, 16f)
-                line(canvas, "TAP / СДЕЛАТЬ ФОТО / TAKE PHOTO", 590f, 16f)
-                line(canvas, "SWIPE BACK: SYNC / СИНХРОНИЗАЦИЯ", 615f, 16f)
+                line(canvas, "待機中", 565f, 16f)
+                line(canvas, "タップ または「撮影」", 590f, 16f)
+                line(canvas, "後スワイプ: 同期", 615f, 16f)
                 canvas.restore()
                 return
             }
-            line(canvas, "RESTEP", 44f, 30f)
-            paint.strokeWidth = 2f
-            canvas.drawLine(20f, 58f, 460f, 58f, paint)
+            if (syncPage) drawSync(canvas) else drawRecord(canvas)
+            canvas.restore()
+        }
+
+        /** 同期画面。タイトルは同期の状態、本文は「何をすればよいか」だけ。 */
+        private fun drawSync(canvas: Canvas) {
+            val transferring = server.transferring
+            val connected = directSync.bleConnected || server.recentlyActive
+            title(canvas, when { transferring -> "スマホに転送中"; connected -> "スマホと同期中"; else -> "スマホから切断中" })
+            val unsynced = unsyncedCount()
+            line(canvas, "未同期の手順は${unsynced}件です", 106f, 22f)
+            when {
+                transferring -> line(canvas, "転送中です。そのままお待ちください", 170f, 20f)
+                connected -> line(canvas, "スマホとつながっています", 170f, 20f)
+                else -> {
+                    line(canvas, "スマホ側で同期ボタンを押してください", 170f, 20f)
+                    if (unsynced == 0 && server.everTransferred) line(canvas, "同期は完了しています", 207f, 18f)
+                }
+            }
+            val detail = directSync.state
+            if (detail != "スマホからの接続待ち" && detail != "オフ") line(canvas, detail, 250f, 16f)
+            line(canvas, if (directSync.active) "タップ: 同期を閉じる" else "タップ: もう一度つなぐ", 300f, 18f)
+            // 自動でつながらないときだけ使う手動接続の情報。
+            line(canvas, "つながらないとき（手動接続）", 360f, 16f)
+            line(canvas, "Wi-Fi名: ${directSync.ssid}", 392f, 15f)
+            line(canvas, "パスワード: ${directSync.wifiPassword}", 420f, 15f)
+            line(canvas, if (directSync.groupHost.isEmpty()) "IP: 準備中" else "IP: ${directSync.groupHost}  コード: $pairCode", 448f, 15f)
+            line(canvas, "同じWi-Fiなら IP: ${localIp() ?: "なし"}  コード: $pairCode", 476f, 15f)
+            canvas.drawLine(20f, 562f, 460f, 562f, paint)
+            line(canvas, status.take(42), 599f, 17f)
+            postInvalidateDelayed(700)
+        }
+
+        /** 記録画面。タイトルは記録の状態、本文は今すること、操作の案内は1か所だけ。 */
+        private fun drawRecord(canvas: Canvas) {
             val current = store.current()
             val count = current?.getJSONArray("steps")?.length() ?: 0
-            line(canvas, if (current == null) "DISASSEMBLY FINISHED" else "DISASSEMBLY IN PROGRESS", 106f, 20f)
-            line(canvas, "PHOTOS: $count", 143f)
-            if (syncPage) {
-                line(canvas, "SYNC WITH IPHONE", 211f, 26f)
-                line(canvas, directSync.state, 257f, 19f)
-                line(canvas, directSync.ssid, 298f, 18f)
-                line(canvas, "IPHONE: RESTEP > CONNECT & SYNC", 342f, 17f)
-                line(canvas, "ALLOW BLUETOOTH PAIRING", 378f, 17f)
-                line(canvas, if (directSync.active) "TAP / DOUBLE TAP: CLOSE SYNC" else "TAP: RETRY / WI-FI SETTINGS", 417f, 17f)
-                line(canvas, "TAP NOTE: ${voice.language.uppercase()}  FORWARD: SWITCH", 464f, 17f)
-                line(canvas, "MANUAL: ${localIp() ?: "NO LAN"}  $pairCode", 508f, 15f)
-                postInvalidateDelayed(1500)
-            } else {
-                when {
-                    capturing -> {
-                        line(canvas, "TAKING PHOTO", 218f, 22f)
-                        line(canvas, "HOLD STILL...", 253f, 19f)
-                    }
-                    current == null -> {
-                        line(canvas, "DISASSEMBLY FINISHED", 180f, 18f)
-                        line(canvas, "FORWARD: NEW DISASSEMBLY", 218f, 20f)
-                    }
-                    pendingPhoto == null -> {
-                        line(canvas, "WAITING", 180f, 18f)
-                        line(canvas, "СДЕЛАТЬ ФОТО / TAKE PHOTO", 218f, 19f)
-                        line(canvas, "SAY A DESCRIPTION AFTER THE PHOTO", 253f, 17f)
-                        line(canvas, "THEN: ОТПРАВИТЬ / SEND", 287f, 18f)
-                    }
-                    else -> {
-                        line(canvas, "PHOTO READY", 180f, 18f)
-                        line(canvas, if (status.startsWith("LOADING")) "PREPARING MICROPHONE..."
-                            else "SAY THE STEP DESCRIPTION", 218f, 20f)
-                        line(canvas, "ОТПРАВИТЬ / SEND / SEND NOTE", 253f, 19f)
-                        line(canvas, "NOTE LANGUAGE: ${voice.language.uppercase()}", 287f, 17f)
-                    }
+            title(canvas, if (current == null) "記録完了" else "記録中")
+            line(canvas, if (current == null) "手順の記録は完了しました" else "手順の記録: ${count}件", 106f, 20f)
+            when {
+                capturing -> {
+                    line(canvas, "撮影中", 170f, 22f)
+                    line(canvas, "動かないでください", 207f, 19f)
                 }
-                if (current != null) line(canvas, if (pendingPhoto != null)
-                    "TAP: SAVE PHOTO + NOTE" else "TAP: TAKE PHOTO", 330f, 19f)
-                line(canvas, "FORWARD: CONTINUE / NEW", 367f, 18f)
-                line(canvas, "SWIPE BACK: OPEN SYNC", 404f, 19f)
-                line(canvas, if (current == null) "DOUBLE TAP: EXIT" else "DOUBLE TAP: FINISH", 439f, 18f)
-                val spokenNote = if (pendingPhoto != null) voice.currentDraft() else ""
-                if (spokenNote.isNotBlank()) {
-                    line(canvas, "NEW NOTE:", 468f, 17f)
-                    line(canvas, spokenNote.take(42), 497f, 18f)
-                    if (spokenNote.length > 42) line(canvas, spokenNote.drop(42).take(42), 525f, 18f)
-                } else if (count > 0) {
-                    val last = current!!.getJSONArray("steps").getJSONObject(count - 1).optString("note")
-                    line(canvas, "LAST NOTE:", 468f, 17f)
-                    line(canvas, (last.ifBlank { "NO DESCRIPTION" }).take(42), 497f, 18f)
-                    if (last.length > 42) line(canvas, last.drop(42).take(42), 525f, 18f)
+                current == null -> line(canvas, "新しい記録を始めるには前スワイプ", 175f, 19f)
+                pendingPhoto == null -> {
+                    line(canvas, "「撮影」と言うか、タップ", 175f, 22f)
+                    line(canvas, "写真を撮ってから説明を話します", 212f, 18f)
                 }
-                if (pendingPhoto != null) postInvalidateDelayed(250)
+                else -> {
+                    line(canvas, if (isLoading()) "マイク準備中..." else "手順の説明を話してください", 175f, 22f)
+                    line(canvas, "話し終えたら「送信」", 212f, 19f)
+                    line(canvas, "言い直すときは「やり直し」", 247f, 18f)
+                }
             }
+            // 操作の案内（ここだけに書く）
+            if (current != null) line(canvas, if (pendingPhoto != null) "タップ: 写真とメモを保存" else "タップ: 撮影", 310f, 18f)
+            line(canvas, "前スワイプ: 記録の継続・新規", 342f, 18f)
+            line(canvas, "後スワイプ: スマホと同期", 374f, 18f)
+            line(canvas, if (current == null) "ダブルタップ: 閉じる" else "ダブルタップ: 記録完了", 406f, 18f)
+            val spokenNote = if (pendingPhoto != null) voice.currentDraft() else ""
+            if (spokenNote.isNotBlank()) {
+                line(canvas, "今のメモ:", 450f, 17f)
+                line(canvas, spokenNote.take(NOTE_LINE), 480f, 18f)
+                if (spokenNote.length > NOTE_LINE) line(canvas, spokenNote.drop(NOTE_LINE).take(NOTE_LINE), 508f, 18f)
+            } else if (count > 0) {
+                val last = current!!.getJSONArray("steps").getJSONObject(count - 1).optString("note")
+                line(canvas, "前回のメモ:", 450f, 17f)
+                line(canvas, (last.ifBlank { "説明なし" }).take(NOTE_LINE), 480f, 18f)
+                if (last.length > NOTE_LINE) line(canvas, last.drop(NOTE_LINE).take(NOTE_LINE), 508f, 18f)
+            }
+            if (pendingPhoto != null) postInvalidateDelayed(250)
             canvas.drawLine(20f, 562f, 460f, 562f, paint)
-            if (syncPage) {
-                line(canvas, status.take(42), 599f, 17f)
-            } else {
-                val visibleStatus = when {
-                    finishRequested -> "FINISHING - SAVING CURRENT STEP"
-                    capturing -> "TAKING PHOTO - HOLD STILL"
-                    status.startsWith("STEP ") -> status
-                    status.startsWith("SPEECH:") || status.startsWith("PHOTO:") || status.startsWith("SAVE:") -> status
-                    pendingPhoto != null && status.startsWith("NOTE READY") -> "NOTE READY"
-                    pendingPhoto != null && status.startsWith("LOADING") -> "LOADING SPEECH - PLEASE WAIT"
-                    pendingPhoto != null -> "PHOTO READY - SAY DESCRIPTION"
-                    current != null -> "WAITING"
-                    else -> "DISASSEMBLY FINISHED"
-                }
-                line(canvas, visibleStatus.take(42), 585f, 16f)
-                val hint = when {
-                    capturing -> "PLEASE WAIT"
-                    pendingPhoto != null -> "TAP TO SAVE / ОТПРАВИТЬ / SEND"
-                    current != null -> "TAP / СДЕЛАТЬ ФОТО / TAKE PHOTO"
-                    else -> "FORWARD: NEW DISASSEMBLY"
-                }
-                line(canvas, hint, 610f, 16f)
+            // 下の欄は「いまの出来事」だけ（保存した・エラーなど）。案内は上に書いたので繰り返さない。
+            val message = when {
+                finishRequested -> "記録を終了中 - 現在の手順を保存"
+                status.startsWith("手順 ") -> status
+                isError(status) -> status
+                pendingPhoto != null && status.startsWith("メモ入力中") -> "メモを聞き取り中"
+                else -> ""
             }
-            canvas.restore()
+            if (message.isNotEmpty()) line(canvas, message.take(42), 595f, 17f)
         }
     }
 }

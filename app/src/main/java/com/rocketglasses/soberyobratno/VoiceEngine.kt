@@ -9,7 +9,6 @@ import android.media.MediaRecorder
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
-import org.json.JSONArray
 import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
@@ -19,16 +18,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 class VoiceEngine(
     private val context: Context,
     private val onCommand: (String) -> Unit,
-    private val onNote: (String) -> Unit,
+    private val onNote: (String, ByteArray?) -> Unit,
     private val onStatus: (String) -> Unit
 ) {
-    private val models = mutableMapOf<String, Model>()
+    private var model: Model? = null
     @Volatile private var worker: Thread? = null
     @Volatile private var cameraSuspended = false
     private val running = AtomicBoolean(false)
-    @Volatile var language = context.getSharedPreferences("voice", Context.MODE_PRIVATE)
-        .getString("language", "ru") ?: "ru"
-        private set
     @Volatile private var desiredRunning = false
     @Volatile private var loading = false
     @Volatile private var noteMode = false
@@ -36,46 +32,74 @@ class VoiceEngine(
     @Volatile private var draft = ""
     @Volatile private var partial = ""
     @Volatile private var submitRequested = false
+    // メモ中の音声（16kHz モノラル PCM）。文字起こしの精度検証と、あとでスマホで文字起こしするために保存する。
+    private val audioLock = Any()
+    private var noteAudio: java.io.ByteArrayOutputStream? = null
+    // マイクの読み取り専用スレッド。認識（重い処理）と分けて、録音が途切れないようにする。
+    @Volatile private var captureThread: Thread? = null
+    private val captureRunning = AtomicBoolean(false)
+    private val chunks = java.util.concurrent.LinkedBlockingQueue<ShortArray>(CHUNK_QUEUE_LIMIT)
 
-    fun switchLanguage(): String {
-        language = if (language == "ru") "en" else "ru"
-        context.getSharedPreferences("voice", Context.MODE_PRIVATE).edit()
-            .putString("language", language).apply()
-        return language
+    init {
+        // 旧バージョンが展開したロシア語・英語モデルを削除してストレージを空ける。
+        Thread {
+            listOf("model-ru", "model-en").forEach { name ->
+                context.getExternalFilesDir(null)?.resolve(name)?.takeIf { it.exists() }?.deleteRecursively()
+            }
+        }.apply { name = "OldModelCleanup"; start() }
     }
 
     @Synchronized fun start() {
         desiredRunning = true
+        startCapture()   // モデルの読み込みを待たずに、先にマイクを開く
         if (cameraSuspended || running.get() || worker != null || loading) return
-        if (models.size == 2) {
-            startWorker(models.getValue("ru"), models.getValue("en"))
-            return
-        }
+        val ready = model
+        if (ready != null) { startWorker(ready); return }
         loading = true
-        val missing = if (!models.containsKey("ru")) "ru" else "en"
-        onStatus("LOADING RU / EN SPEECH")
-        val selected = "model-$missing"
-        StorageService.unpack(context.applicationContext, selected, selected,
+        onStatus("音声認識を読み込み中")
+        StorageService.unpack(context.applicationContext, "model-ja", "model-ja",
             { loaded ->
                 synchronized(this) {
-                    if (cameraSuspended) loaded.close() else models[missing] = loaded
+                    if (cameraSuspended) loaded.close() else model = loaded
                     loading = false
                     if (desiredRunning) start()
                 }
             }, { error ->
                 loading = false
-                onStatus("SPEECH: ${error.message ?: "ERROR"}")
+                onStatus("音声: ${error.message ?: "エラー"}")
             })
     }
 
-    private fun startWorker(ru: Model, en: Model) {
+    private fun startWorker(ja: Model) {
         running.set(true)
-        worker = Thread { loop(ru, en) }.apply { name = "MemoryVoice"; start() }
+        worker = Thread { loop(ja) }.apply { name = "MemoryVoice"; start() }
     }
 
-    fun expectNote(initialText: String = "") { draft = initialText; partial = ""; submitRequested = false; noteMode = true }
-    fun cancelNote() { noteMode = false; draft = ""; partial = ""; submitRequested = false }
-    fun currentDraft(): String = listOf(draft, partial).filter { it.isNotBlank() }.joinToString(" ")
+    fun expectNote(initialText: String = "") {
+        synchronized(audioLock) { noteAudio = java.io.ByteArrayOutputStream() }
+        draft = initialText; partial = ""; submitRequested = false; noteMode = true
+    }
+    fun cancelNote() {
+        synchronized(audioLock) { noteAudio = null }
+        noteMode = false; draft = ""; partial = ""; submitRequested = false
+    }
+
+    private fun appendAudio(samples: ShortArray, count: Int) {
+        synchronized(audioLock) {
+            val out = noteAudio ?: return
+            if (out.size() >= MAX_AUDIO_BYTES) return
+            val bytes = Wav.toLittleEndian(samples, count)
+            out.write(bytes, 0, bytes.size)
+        }
+    }
+
+    /** ここまでに録音したメモの音声を WAV にして返し、録音をリセットする。短すぎる場合は null。 */
+    fun takeAudio(): ByteArray? = synchronized(audioLock) {
+        val out = noteAudio
+        noteAudio = null
+        if (out == null || out.size() < MIN_AUDIO_BYTES) null else Wav.wrap(out.toByteArray())
+    }
+    fun currentDraft(): String = draft + partial
     fun submitNote(): Boolean {
         if (!noteMode || !running.get()) return false
         submitRequested = true
@@ -96,8 +120,8 @@ class VoiceEngine(
             val released = synchronized(this) {
                 if (previous?.isAlive == true || loading) false
                 else {
-                    models.values.forEach { it.close() }
-                    models.clear()
+                    model?.close()
+                    model = null
                     true
                 }
             }
@@ -114,138 +138,158 @@ class VoiceEngine(
     fun close() {
         desiredRunning = false
         suspendForCamera { }
+        Thread { stopCapture() }.apply { name = "MicStop"; start() }
     }
 
-    private fun loop(ru: Model, en: Model) {
+    @Synchronized private fun startCapture() {
+        if (captureThread?.isAlive == true) return
+        if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            onStatus("音声: マイクの権限がありません"); return
+        }
+        captureRunning.set(true)
+        captureThread = Thread { captureLoop() }.apply { name = "MemoryMic"; start() }
+    }
+
+    private fun stopCapture() {
+        captureRunning.set(false)
+        captureThread?.interrupt()
+        captureThread?.join(2000)
+        captureThread = null
+        chunks.clear()
+    }
+
+    /** マイクを読み続ける。認識の速さに関係なく、メモ中の音声はここで直接録音する。 */
+    private fun captureLoop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
-        val ruCommands = JSONArray().apply {
-            put("сделать фото"); put("сделай фото"); put("сфотографировать")
-            put("[unk]")
-        }.toString()
-        val enCommands = JSONArray().apply {
-            put("take photo"); put("take a photo"); put("capture photo")
-            put("[unk]")
-        }.toString()
-        val ruSendCommands = JSONArray(VoiceCommands.russianSend.toList() + "[unk]").toString()
-        val enSendCommands = JSONArray(VoiceCommands.englishSend.toList() + "[unk]").toString()
-        val ruCommandRecognizer = Recognizer(ru, 16000f, ruCommands)
-        val enCommandRecognizer = Recognizer(en, 16000f, enCommands)
-        ruCommandRecognizer.setWords(true)
-        enCommandRecognizer.setWords(true)
-        var noteRecognizer: Recognizer? = null
         var record: AudioRecord? = null
         try {
-            check(context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
-                PackageManager.PERMISSION_GRANTED) { "Microphone permission missing" }
             val min = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT)
-            require(min > 0) { "Microphone unavailable" }
+            require(min > 0) { "マイクが使えません" }
+            // 以前は約0.1秒分しかなく、認識が遅れるとその間の音声が捨てられていた。4秒分に広げる。
             record = AudioRecord(MediaRecorder.AudioSource.MIC, 16000,
-                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(min, 3200))
-            check(record.state == AudioRecord.STATE_INITIALIZED) { "Microphone could not open" }
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
+                maxOf(min, Wav.SAMPLE_RATE * 2 * 4))
+            check(record.state == AudioRecord.STATE_INITIALIZED) { "マイクを開けません" }
             record.startRecording()
-            onStatus(if (noteMode) "NOTE READY. ОТПРАВИТЬ / SEND" else "СДЕЛАТЬ ФОТО / TAKE PHOTO")
             val buffer = ShortArray(800)
-            var wasNote = false
-            var lastPartialAt = 0L
-            while (running.get()) {
+            while (captureRunning.get()) {
                 val n = record.read(buffer, 0, buffer.size)
                 if (n <= 0) continue
                 if (muted) continue
-                val nowNote = noteMode
-                if (nowNote != wasNote) {
-                    partial = ""
-                    ruCommandRecognizer.reset(); enCommandRecognizer.reset()
-                    ruCommandRecognizer.setGrammar(if (nowNote) ruSendCommands else ruCommands)
-                    enCommandRecognizer.setGrammar(if (nowNote) enSendCommands else enCommands)
-                    noteRecognizer?.close()
-                    noteRecognizer = if (nowNote) Recognizer(if (language == "ru") ru else en, 16000f) else null
-                    wasNote = nowNote
-                }
-                if (nowNote) {
-                    val recognizer = noteRecognizer ?: continue
-                    if (submitRequested) {
-                        val finalText = JSONObject(recognizer.finalResult).optString("text").trim()
-                        val text = finalText.ifBlank { partial }
-                        submitRequested = false
-                        finishNote(text)
-                        continue
-                    }
-                    val ruDone = ruCommandRecognizer.acceptWaveForm(buffer, n)
-                    val enDone = enCommandRecognizer.acceptWaveForm(buffer, n)
-                    val ruSend = ruDone && recognizedSend(ruCommandRecognizer.result, "ru")
-                    val enSend = enDone && recognizedSend(enCommandRecognizer.result, "en")
-                    val commandSend = ruSend || enSend
-                    val noteDone = recognizer.acceptWaveForm(buffer, n)
-                    if (commandSend) {
-                        val finalText = JSONObject(if (noteDone) recognizer.result else recognizer.finalResult)
-                            .optString("text").trim()
-                        Log.i("MemoryVoice", "Send command detected: ${if (enSend) "en" else "ru"}")
-                        finishNote(finalText.ifBlank { partial }, commandConfirmed = true)
-                        continue
-                    }
-                    if (!noteDone) {
-                        val now = SystemClock.uptimeMillis()
-                        if (now - lastPartialAt >= 200) {
-                            partial = JSONObject(recognizer.partialResult).optString("partial")
-                            lastPartialAt = now
-                        }
-                        continue
-                    }
-                    partial = ""
-                    val text = JSONObject(recognizer.result).optString("text").trim()
-                    if (text.isNotEmpty()) {
-                        val submission = VoiceCommands.submission(text)
-                        if (submission.send) finishNote(text)
-                        else {
-                            draft = listOf(draft, text).filter { it.isNotBlank() }.joinToString(" ")
-                            onStatus("NOTE READY. ОТПРАВИТЬ / SEND")
-                        }
-                    }
-                } else {
-                    val ruDone = ruCommandRecognizer.acceptWaveForm(buffer, n)
-                    val enDone = enCommandRecognizer.acceptWaveForm(buffer, n)
-                    val ruText = if (ruDone) JSONObject(ruCommandRecognizer.result).optString("text").trim() else ""
-                    val enText = if (enDone) JSONObject(enCommandRecognizer.result).optString("text").trim() else ""
-                    val recognized = when {
-                        ruText in setOf("сделать фото", "сделай фото", "сфотографировать") -> "ru" to ruText
-                        enText in setOf("take photo", "take a photo", "capture photo") -> "en" to enText
-                        else -> null
-                    }
-                    if (recognized != null) {
-                        language = recognized.first
-                        context.getSharedPreferences("voice", Context.MODE_PRIVATE).edit()
-                            .putString("language", language).apply()
-                        ruCommandRecognizer.reset(); enCommandRecognizer.reset()
-                        onCommand(recognized.second)
-                    }
-                }
+                if (noteMode) appendAudio(buffer, n)
+                if (running.get()) {
+                    // 認識が追いつかないときは古い音声から捨てる（録音そのものには影響しない）。
+                    if (!chunks.offer(buffer.copyOf(n))) { chunks.poll(); chunks.offer(buffer.copyOf(n)) }
+                } else if (chunks.isNotEmpty()) chunks.clear()
             }
         } catch (e: Exception) {
-            onStatus("SPEECH: ${e.message ?: "ERROR"}")
+            onStatus("音声: ${e.message ?: "エラー"}")
         } finally {
             try { record?.stop() } catch (_: Exception) {}
             record?.release()
-            ruCommandRecognizer.close(); enCommandRecognizer.close(); noteRecognizer?.close()
+            captureRunning.set(false)
+        }
+    }
+
+    private fun loop(ja: Model) {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+        // 待機中も入力中も、日本語モデル1つの自由認識だけを使う（メモリ節約）。
+        var recognizer: Recognizer? = null
+        try {
+            chunks.clear()
+            onStatus(if (noteMode) "メモ入力中。「送信」で保存" else "「撮影」と言ってください")
+            var wasNote: Boolean? = null
+            var lastPartialAt = 0L
+            while (running.get()) {
+                val data = chunks.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
+                val n = data.size
+                val buffer = data
+                val nowNote = noteMode
+                if (nowNote != wasNote) {
+                    // モードが変わったら認識器を作り直し、前のモードの音声を持ち越さない。
+                    partial = ""
+                    recognizer?.close()
+                    recognizer = Recognizer(ja, 16000f)
+                    wasNote = nowNote
+                }
+                val rec = recognizer ?: continue
+                if (nowNote) {
+                    if (submitRequested) {
+                        val finalText = VoiceCommands.normalize(JSONObject(rec.finalResult).optString("text"))
+                        submitRequested = false
+                        finishNote(finalText.ifBlank { partial })
+                        continue
+                    }
+                    if (!rec.acceptWaveForm(buffer, n)) {
+                        val now = SystemClock.uptimeMillis()
+                        if (now - lastPartialAt >= 200) {
+                            partial = VoiceCommands.normalize(JSONObject(rec.partialResult).optString("partial"))
+                            lastPartialAt = now
+                            if (VoiceCommands.endsWithRedo(partial)) {
+                                // 「やり直し」: ここまでの文字と音声を捨てて、次の発話から録り直す。
+                                rec.reset()
+                                redoNote()
+                            }
+                        }
+                        continue
+                    }
+                    partial = ""
+                    val text = VoiceCommands.normalize(JSONObject(rec.result).optString("text"))
+                    if (text.isEmpty()) continue
+                    Log.i("MemoryVoice", "Note heard: $text")
+                    var heard = text
+                    if (VoiceCommands.containsRedo(heard)) {
+                        // 途中で「やり直し」が検出されなかった場合: その言葉より前を捨てる。
+                        redoNote()
+                        heard = VoiceCommands.afterLastRedo(heard)
+                    }
+                    val submission = VoiceCommands.submission(heard)
+                    if (submission.send) finishNote(heard)
+                    else {
+                        draft = draft + heard
+                        onStatus("メモ入力中。「送信」で保存")
+                    }
+                } else {
+                    if (!rec.acceptWaveForm(buffer, n)) continue
+                    val text = VoiceCommands.normalize(JSONObject(rec.result).optString("text"))
+                    if (text.isEmpty()) continue
+                    Log.i("MemoryVoice", "Heard while waiting: $text")
+                    if (VoiceCommands.isPhotoCommand(text)) {
+                        rec.reset()
+                        onCommand(COMMAND_PHOTO)
+                    }
+                }
+            }
+        } catch (e: InterruptedException) {
+            // 停止要求
+        } catch (e: Exception) {
+            onStatus("音声: ${e.message ?: "エラー"}")
+        } finally {
+            recognizer?.close()
             running.set(false)
             worker = null
         }
     }
 
-    private fun recognizedSend(json: String, language: String): Boolean {
-        val result = JSONObject(json)
-        val words = result.optJSONArray("result") ?: return false
-        if (words.length() == 0) return false
-        val confidence = (0 until words.length()).minOf { words.getJSONObject(it).optDouble("conf", 0.0) }
-        return VoiceCommands.isSendCommand(result.optString("text"), language, confidence)
+    private fun redoNote() {
+        draft = ""; partial = ""
+        synchronized(audioLock) { if (noteAudio != null) noteAudio = java.io.ByteArrayOutputStream() }
+        onStatus("やり直し。もう一度どうぞ")
     }
 
     private fun finishNote(text: String, commandConfirmed: Boolean = false) {
-        val combined = listOf(draft, text).filter { it.isNotBlank() }.joinToString(" ")
-        draft = VoiceCommands.submission(combined, commandConfirmed).note
+        draft = VoiceCommands.submission(draft + text, commandConfirmed).note
         partial = ""
         noteMode = false
-        onNote(draft)
+        onNote(draft, takeAudio())
+    }
+
+    companion object {
+        const val COMMAND_PHOTO = "photo"
+        private const val MAX_AUDIO_BYTES = Wav.SAMPLE_RATE * 2 * 120 // 最長 120 秒
+        private const val MIN_AUDIO_BYTES = Wav.SAMPLE_RATE * 2 / 5   // 0.2 秒未満は保存しない
+        private const val CHUNK_QUEUE_LIMIT = 200                       // 50ms × 200 = 約10秒
     }
 
     fun stop() {
@@ -253,6 +297,7 @@ class VoiceEngine(
         running.set(false)
         worker?.interrupt()
         worker?.join(2000)
+        stopCapture()
         // A live native decoder must finish before another worker can use its models.
     }
 }

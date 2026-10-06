@@ -39,8 +39,11 @@ class PhotoCapture(private val context: Context) {
                 ?: error("Camera outputs unavailable")
             val sizes = outputs.getOutputSizes(ImageFormat.JPEG) ?: error("JPEG unavailable")
             // Use the native 1600x1200 JPEG to retain detail without 4K file sizes.
+            // 実機グラスには 1600x1200 がある。エミュレータなど無い場合は、最大の 4:3、それも無ければ最大の出力を使う。
             val size = sizes.firstOrNull { it.width == 1600 && it.height == 1200 }
-                ?: error("1600x1200 camera output unavailable")
+                ?: sizes.filter { it.width * 3 == it.height * 4 }.maxByOrNull { it.width * it.height }
+                ?: sizes.maxByOrNull { it.width * it.height }
+                ?: error("camera output unavailable")
             Log.d("MemoryCamera", "JPEG size ${size.width}x${size.height}")
             val orientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
             previewTexture = SurfaceTexture(0).apply { setDefaultBufferSize(640, 480) }

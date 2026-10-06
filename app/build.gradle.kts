@@ -8,9 +8,9 @@ android {
             "com.rocketglasses.soberyobratno.inputtest" else "com.rocketglasses.soberyobratno"
         minSdk = 28
         targetSdk = 33
-        versionCode = 18
-        versionName = "0.18"
-        ndk { abiFilters += listOf("arm64-v8a") }
+        versionCode = 19
+        versionName = "0.19-ja"
+        ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

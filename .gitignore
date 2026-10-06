@@ -11,3 +11,13 @@ verification/
 releases/
 *.iml
 local.properties
+
+# --- 日本語版で追加 ---
+# Vosk 日本語モデル（download-model.ps1 で取得する。約50MB）
+app/src/main/assets/model-ja/
+# Android Studio / Kotlin の作業ファイル
+.idea/
+.kotlin/
+phone/build/
+# 自分の声の録音サンプル（公開リポジトリに載せない）
+samples/*.wav

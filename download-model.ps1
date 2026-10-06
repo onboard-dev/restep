@@ -1,9 +1,13 @@
 $ErrorActionPreference = 'Stop'
 $assets = Join-Path $PSScriptRoot 'app\src\main\assets'
 New-Item -ItemType Directory -Force $assets | Out-Null
+# Japanese-only build: remove old Russian/English models if present
+foreach ($old in @('model-ru', 'model-en')) {
+    $path = Join-Path $assets $old
+    if (Test-Path $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+}
 @(
-    @{ Name = 'ru'; Version = 'vosk-model-small-ru-0.22'; UUID = 'ru-small-0.22-v1' },
-    @{ Name = 'en'; Version = 'vosk-model-small-en-us-0.15'; UUID = 'en-small-0.15-v1' }
+    @{ Name = 'ja'; Version = 'vosk-model-small-ja-0.22'; UUID = 'ja-small-0.22-v1' }
 ) | ForEach-Object {
     $zip = Join-Path $env:TEMP ($_.Version + '.zip')
     $model = Join-Path $assets ('model-' + $_.Name)
