@@ -1,56 +1,79 @@
-# ReStep — record the way back
+# ReStep 日本語版（個人用フォーク）
 
-**Your hands are busy. Record the repair with your voice.**
+Rokid グラスで「撮影」と言って写真を撮り、手順を声でメモして記録する DIY アプリ [ReStep](https://github.com/oldmelnick-afk/restep)（作者: oldmelnick-afk）を、日本語で使えるように改修した個人用のフォークです。作者の公式版ではありません。元リポジトリにライセンスの表記がないため、私的利用の範囲で使っています。
 
-ReStep is a DIY app for Rokid RG-glasses and companion apps for iPhone and Android. Say **Take photo**, describe the step, then say **Send** or **Send note**. The glasses save the photo and note together, so you can keep holding the part and tools. After syncing to your phone, follow the steps in reverse order to put everything back together.
+> **開発中の方針転換（`stepmemo` ブランチ）**
+> グラスとスマホの直接同期が不安定だったため、**StepMemo** という名前で作り直す検討をしています。写真に撮影の説明（`#StepMemo` のタグと文字起こし）を埋め込み、Hi Rokid の標準アルバム同期でスマホに運んで手順を組み立て直す方式です。まだ実装前で、Hi Rokid の同期で情報が残るかの検証から始めます。詳しくは [docs/HANDOFF.md](docs/HANDOFF.md) を見てください。
+> この `main` ブランチは、直接同期方式の最終版（タグ `v0.19-ja-sync`）です。
 
-[Download APKs and iPhone IPA](https://github.com/oldmelnick-afk/restep/releases) · [Project page](https://aleksandrmelnik.ru/craftcode#restep)
+## できること（日本語版 0.19-ja / スマホ 0.2-ja）
 
-![Illustrative workshop demo](design/promo/workshop-demo.png)
+### グラス側アプリ（`app/`、versionName 0.19-ja）
 
-[Full project guide (PDF)](docs/ReStep-Project-Guide.pdf) - controls, setup, sync, screenshots and current limitations.
+- 日本語の音声コマンドをオフラインで認識します（Vosk の日本語小モデル）。
+  - 撮影:「撮影」「写真を撮って」「シャッター」など
+  - 保存:「送信」「送信して」
+  - 取り消し:「やり直し」（それまでのメモと音声を捨て、続きから記録し直す）
+- メモ中の音声を 16kHz モノラルの WAV で最長120秒まで録音し、写真・メモと一緒に保存します。
+- 画面表示はすべて日本語です。
+- 背面カメラや 1600×1200 がない環境（エミュレータ）でも撮影できます。
 
-## Capture without using your hands
+### スマホ側アプリ（`phone/`、versionName 0.2-ja、Android 10 以上）
 
-- Offline Russian and English voice commands: “сделать фото” / “take photo”, then “отправить” / “send” / “send note”. Pause briefly before the save command.
-- One tap takes a photo; the next tap saves the description as an alternative to voice.
-- Quiet waiting mode hides the full HUD after five seconds. During dictation the note stays visible.
-- Saved steps survive restarts; continue the same session until a double tap finishes it. Another double tap exits. An unfinished, unsaved note can be lost on shutdown.
-- Native 1600 × 1200 JPEG capture, with a short exposure warm-up.
-- Swipe back to open sync. Phone transfer is a separate step; it is not voice-operated.
+- グラスから写真・メモ・音声を同期して、ライブラリに保存します。
+- 組み立て順・分解順で手順を表示します。写真は EXIF の向きを反映します。
+- 音声の文字起こし（外部サービス）: OpenRouter（既定は qwen/qwen3-asr-flash、予備は whisper-large-v3-turbo）か、OpenAI 互換の URL（自宅サーバー用）を設定で選べます。「やり直し」より前は捨て、末尾の「送信」は除いて説明欄に入れます。結果は編集できます。
+- 音声の再生と書き出し（Music/ReStep）、手順の PDF 書き出し（ダウンロード/ReStep）ができます。
+- 進捗の表示は「戻し済み」など、日本語です。
 
-## Phone apps
+## 現状と既知の課題
 
-Both companions keep an offline library, show assembly in reverse order, allow note/title edits and completion marks. Deleting a project queues deletion from the glasses at the next successful sync. Tombstones prevent deleted projects from returning during import. Save any pending photo before deleting its active session.
+| 項目 | 状態 |
+|---|---|
+| グラス側アプリ 0.19-ja | 実機（Rokid グラス）で動作確認済み。ただし下の課題あり |
+| スマホ側アプリ 0.2-ja | 文字起こし・PDF 書き出し・画面の日本語化は実装済みですが、**Android Studio でのビルドと実機確認がまだ**です |
+| iPhone アプリ（`ios/`） | 元のままです（ロシア語・英語）。日本語化していません |
 
-**iPhone 0.10:** install the unsigned IPA using Sideloadly or AltStore with your own Apple account. Standard build: Bluetooth discovers the connection settings; join the glasses Wi-Fi in Settings when prompted, then return to ReStep. This release does not include Auto Wi-Fi. Deployment target: see the Xcode project.
+- スマホとグラスの同期が成功しにくい（これが StepMemo 方針の動機です）
+- 長く使うと「撮影」に反応しなくなることがある
+- グラスのマイクは話し始めが遅れ、語尾が切れやすい（先に「あの」と言ってから話すと安定）
+- 文字起こしの精度は完全ではありません。Vosk 小モデルは誤認識が多いため、グラスでは合図の認識だけに使い、メモは録音して後で文字起こしする方針です
 
-**Android phone 0.1 (preview):** Android 10+. Install `ReStep-Android-v0.1.apk` on the PHONE. Open Sync on the glasses, then Connect & sync on the phone. Grant nearby-device/location permissions and approve Android’s Wi-Fi request. Some phones also require Location services enabled for Wi-Fi discovery. Manual same-network IP/code sync is available as a fallback. The phone APK is separate from the glasses APK.
+## プライバシー
 
-**Glasses 0.18:** install `restep-glasses-v0.18.apk` on the GLASSES via your existing ADB/sideload setup. This project does not modify firmware. Tested model: Rokid RG-glasses / Android 12; other models are untested.
+- 写真・メモ・音声は、基本的に端末内に保存されます。
+- 音声の文字起こしを使うと、**音声が外部サービス（OpenRouter など）に送信されます**。API キーは端末内にだけ保存します。個人利用が前提で、学校の業務や個人情報を含む場面では使わないでください。
 
-## Privacy and scope
+## ビルド方法
 
-Photos and notes remain in local app storage. No account or cloud service is required for capture or transfer. Direct sync uses a WPA2 glasses network, encrypted Bluetooth settings and a fresh session token. Legacy manual transfer uses a six-digit code over your trusted local network. Uninstalling can remove local data.
+Android Studio で ReStep フォルダ全体を開きます。Android SDK 36.1 と Java 17 以上が必要です。
 
-Speech recognition currently supports Russian and US English with Vosk; it does not inherit every language available in Hi Rokid. Original notes are replayed in reverse step order; ReStep does not automatically rewrite them into repair instructions.
+1. グラス用の Vosk 日本語モデルを取得します（PowerShell）:
+   ```
+   .\download-model.ps1
+   ```
+   `app/src/main/assets/model-ja` に展開されます（Git には入れません）。モデルのライセンスは https://alphacephei.com/vosk/models を見てください。
+2. ビルド:
+   ```
+   .\gradlew :app:assembleDebug     # グラス用
+   .\gradlew :phone:assembleDebug   # スマホ用
+   ```
+3. 出力される APK:
+   - グラス: `app\build\outputs\apk\debug\app-debug.apk`
+   - スマホ: `phone\build\outputs\apk\debug\phone-debug.apk`
 
-## Build
+グラス用 APK は、お使いの ADB 環境から Rokid グラスにインストールします（ファームウェアは変更しません）。エミュレータで確認するために `app/build.gradle.kts` の `abiFilters` に `x86_64` を足してあります。実機用ビルドでは外して構いません。
 
-Install Android SDK 36.1 and Java 17+. Set `ANDROID_HOME` and `JAVA_HOME` (or use Android Studio). `./gradlew :phone:assembleDebug` builds the phone companion. For glasses, run `download-model.ps1` to download the official small RU/EN Vosk models, then `./gradlew :app:assembleDebug`. Model licenses are available at https://alphacephei.com/vosk/models.
+## フォルダの構成
 
-On a Mac with Xcode, run `bash ios/build-unsigned-ipa.sh`. The iOS workflow also runs focused deletion checks. `ios/capture-demo.sh` builds an isolated simulator configuration with sample data for screenshots; this demo is excluded from normal builds.
+| フォルダ | 内容 |
+|---|---|
+| `app/` | グラス用アプリ（Kotlin、パッケージ名は元の `soberyobratno` のまま） |
+| `phone/` | Android スマホ用アプリ（Kotlin） |
+| `ios/` | iPhone アプリ（元のまま） |
+| `docs/` | 引き継ぎメモ（HANDOFF.md）、元の作者のプロジェクトガイド（PDF） |
+| `samples/` | 文字起こしの比較スクリプトと結果、StepMemo の検証用テスト画像。録音ファイル（.wav）は Git に入れていません |
 
-## Verification and limitations
+## 元のプロジェクトについて
 
-Glasses camera and controls have been exercised on physical RG-glasses. iPhone 0.10 was built on macOS and used by the owner. Android phone 0.1 builds and passes lint (warnings remain), launches in an Android emulator, and passes focused checks for persisted deletion, shared-photo retention, stale imports, edit preservation and connection-address validation. **Android Bluetooth pairing and direct Wi-Fi transfer still need testing on a physical phone.** Treat it as a preview, not a fully validated release. Voice accuracy depends on pronunciation and background noise; a tap is the fallback.
-
-## Screenshots and illustrative media
-
-The two phone images below are real iOS Simulator captures with synthetic demo data. Workshop and through-glasses scenes are AI-generated illustrations; the green overlay is a simulated view based on the app layout, not a physical camera recording.
-
-<img src="design/promo/iphone-session.png" width="300" alt="iPhone assembly screen, demo data"> <img src="design/promo/iphone-sync.png" width="300" alt="iPhone sync screen">
-
-![Simulated view through glasses](design/promo/glasses-view-demo.png)
-
-Tags: Rokid · smart glasses · hands-free · repair · disassembly · reassembly · Android · iOS · Kotlin · SwiftUI · offline.
+元の ReStep（ロシア語・英語版、iPhone アプリ付き）の説明・配布物・プロジェクトガイドは、元リポジトリ https://github.com/oldmelnick-afk/restep を見てください。元の画像やイラストは、この README には載せていません。
