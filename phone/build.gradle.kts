@@ -10,6 +10,11 @@ android {
         versionName = "0.2-ja"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
+    // StepMemo: グラスとスマホで共通のファイル形式の部品（ルートの shared/）
+    sourceSets {
+        getByName("main") { kotlin.srcDir("../shared/src/main/kotlin") }
+        getByName("test") { kotlin.srcDir("../shared/src/test/kotlin") }
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

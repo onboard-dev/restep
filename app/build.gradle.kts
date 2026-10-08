@@ -12,6 +12,11 @@ android {
         versionName = "0.19-ja"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
+    // StepMemo: グラスとスマホで共通のファイル形式の部品（ルートの shared/）
+    sourceSets {
+        getByName("main") { kotlin.srcDir("../shared/src/main/kotlin") }
+        getByName("test") { kotlin.srcDir("../shared/src/test/kotlin") }
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
