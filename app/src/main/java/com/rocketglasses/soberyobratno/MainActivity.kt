@@ -554,9 +554,7 @@ class MainActivity : Activity() {
             val sx = width / 480f; val sy = height / 640f
             canvas.save(); canvas.scale(sx, sy)
             if (quietMode && !syncPage && !capturing && pendingPhoto == null) {
-                line(canvas, "待機中", 565f, 16f)
-                line(canvas, "タップ または「撮影」", 590f, 16f)
-                line(canvas, "後スワイプ: 同期", 615f, 16f)
+                line(canvas, "待機中：撮影はタップか「撮影」同期は後スワイプ", 40f, 16f)
                 canvas.restore()
                 return
             }
