@@ -17,6 +17,9 @@ internal object VoiceCommands {
     /** 送信（メモ確定）コマンド。メモの末尾に付けても、単独で言ってもよい。 */
     val sendCommands = setOf("送信", "送信して", "送信する", "メモ送信", "そうしん")
 
+    /** 撮影後に写真をやめる（キャンセル）。説明の一部と区別するため、短い発話全体が一致したときだけ。 */
+    val cancelCommands = setOf("キャンセル", "キャンセルして", "キャンセルする")
+
     /** 「やり直し」: 直後に「た」「て」などが続く普通の文（やり直した 等）は除く。 */
     private val redoRegex = Regex("(やり直し|やりなおし)(?![たてをがはのにでも])")
     private val redoEndRegex = Regex("(やり直し|やりなおし)$")
@@ -47,14 +50,16 @@ internal object VoiceCommands {
 
     private fun stripPunctuation(text: String) = text.trimEnd('。', '、', '.', ',', '!', '！', ' ')
 
-    fun submission(text: String, commandConfirmed: Boolean = false): Submission {
+    fun submission(text: String): Submission {
         val clean = stripPunctuation(normalize(text))
         for (ending in endings) {
             if (clean == ending) return Submission("", true)
             if (clean.endsWith(ending)) return Submission(stripPunctuation(clean.dropLast(ending.length)), true)
         }
-        return Submission(clean, commandConfirmed)
+        return Submission(clean, false)
     }
+
+    fun isCancelCommand(text: String): Boolean = stripPunctuation(normalize(text)) in cancelCommands
 
     fun isPhotoCommand(text: String): Boolean {
         val clean = stripPunctuation(normalize(text))

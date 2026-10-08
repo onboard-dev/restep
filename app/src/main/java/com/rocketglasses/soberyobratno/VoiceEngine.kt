@@ -244,6 +244,13 @@ class VoiceEngine(
                         redoNote()
                         heard = VoiceCommands.afterLastRedo(heard)
                     }
+                    if (VoiceCommands.isCancelCommand(heard)) {
+                        // 「キャンセル」: この写真と、ここまでの説明・音声を捨てる。
+                        noteMode = false; draft = ""; partial = ""
+                        synchronized(audioLock) { noteAudio = null }
+                        onCommand(COMMAND_CANCEL)
+                        continue
+                    }
                     val submission = VoiceCommands.submission(heard)
                     if (submission.send) finishNote(heard)
                     else {
@@ -278,8 +285,8 @@ class VoiceEngine(
         onStatus("やり直し。もう一度どうぞ")
     }
 
-    private fun finishNote(text: String, commandConfirmed: Boolean = false) {
-        draft = VoiceCommands.submission(draft + text, commandConfirmed).note
+    private fun finishNote(text: String) {
+        draft = VoiceCommands.submission(draft + text).note
         partial = ""
         noteMode = false
         onNote(draft, takeAudio())
@@ -287,6 +294,7 @@ class VoiceEngine(
 
     companion object {
         const val COMMAND_PHOTO = "photo"
+        const val COMMAND_CANCEL = "cancel"
         private const val MAX_AUDIO_BYTES = Wav.SAMPLE_RATE * 2 * 120 // 最長 120 秒
         private const val MIN_AUDIO_BYTES = Wav.SAMPLE_RATE * 2 / 5   // 0.2 秒未満は保存しない
         private const val CHUNK_QUEUE_LIMIT = 200                       // 50ms × 200 = 約10秒

@@ -21,17 +21,20 @@ class VoiceCommandsTest {
             VoiceCommands.submission("送信 機 の 蓋 を 開ける"))
     }
 
-    @Test fun tapConfirmationKeepsNote() {
-        assertEquals(VoiceCommands.Submission("配線を外す", true),
-            VoiceCommands.submission("配線 を 外す", commandConfirmed = true))
-    }
-
     @Test fun photoCommandMustBeWholeUtterance() {
         assertTrue(VoiceCommands.isPhotoCommand("撮影"))
         assertTrue(VoiceCommands.isPhotoCommand("写真 を 撮っ て"))
         assertTrue(VoiceCommands.isPhotoCommand("シャッター"))
         assertFalse(VoiceCommands.isPhotoCommand("撮影 した 写真 を 確認"))
         assertFalse(VoiceCommands.isPhotoCommand("ネジ を 外す"))
+    }
+
+    @Test fun cancelCommandMustBeWholeUtterance() {
+        assertTrue(VoiceCommands.isCancelCommand("キャンセル"))
+        assertTrue(VoiceCommands.isCancelCommand("キャンセル し て"))
+        assertTrue(VoiceCommands.isCancelCommand("キャンセル。"))
+        assertFalse(VoiceCommands.isCancelCommand("予約 を キャンセル"))
+        assertFalse(VoiceCommands.isCancelCommand("キャンセル 待ち の 札"))
     }
 
     @Test fun redoCommand() {

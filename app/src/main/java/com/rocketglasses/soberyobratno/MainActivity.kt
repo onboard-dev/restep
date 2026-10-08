@@ -39,13 +39,6 @@ class MainActivity : Activity() {
     private var capturing = false
     private var finishRequested = false
     private var exitAfterFinish = false
-    private var quietMode = false
-    private val hideMenu = Runnable {
-        if (!capturing && pendingPhoto == null && store.current() != null) {
-            quietMode = true
-            hud.invalidate()
-        }
-    }
     private var lastSwipeAt = 0L
     private var lastSwipeDirection = 0
     private var lastDoubleTapAt = 0L
@@ -79,7 +72,7 @@ class MainActivity : Activity() {
             "pendingPhotoFixture" -> if (packageName.endsWith(".inputtest")) {
                 pendingPhoto = File(cacheDir, "input-fixture.jpg").readBytes()
                 voice.expectNote("gesture test note")
-                showMenu(false)
+                showMenu()
             }
             "doubleTap" -> {
                 val id = android.view.InputDevice.getDeviceIds().firstOrNull {
@@ -90,13 +83,7 @@ class MainActivity : Activity() {
                     dispatchKeyEvent(KeyEvent(now, now, action, KeyEvent.KEYCODE_BACK, 0, 0, id, 158))
                 }
             }
-            "cancelPhoto" -> if (!capturing) {
-                pendingPhoto = null
-                voice.cancelNote()
-                voice.mute(false)
-                setStatus("準備完了")
-                showMenu()
-            }
+            "cancelPhoto" -> cancelPhoto()
             "testCamera" -> camera.take { result ->
                 result.onSuccess {
                     File(cacheDir, "camera-test.jpg").writeBytes(it)
@@ -115,7 +102,6 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
-        hud.removeCallbacks(hideMenu)
         voice.stop()
         super.onPause()
     }
@@ -146,6 +132,7 @@ class MainActivity : Activity() {
     private fun handleCommand(command: String) {
         when (command) {
             VoiceEngine.COMMAND_PHOTO -> takePhoto()
+            VoiceEngine.COMMAND_CANCEL -> cancelPhoto()
         }
     }
 
@@ -155,7 +142,7 @@ class MainActivity : Activity() {
         if (pendingPhoto != null) { setStatus("説明を話して「送信」、またはタップ"); return }
         if (capturing) return
         capturing = true
-        showMenu(false)
+        showMenu()
         voice.mute(true)
         setStatus("撮影中...")
         voice.suspendForCamera { released -> runOnUiThread {
@@ -189,6 +176,17 @@ class MainActivity : Activity() {
         } }
     }
 
+    /** 撮った写真を保存せずに捨てる（「キャンセル」）。説明と音声も捨てる。 */
+    private fun cancelPhoto() {
+        if (capturing || pendingPhoto == null) return
+        pendingPhoto = null
+        hud.removeCallbacks(endPreview); endPreview.run()
+        voice.cancelNote()
+        voice.mute(false)
+        setStatus("写真を取り消しました")
+        if (finishRequested) completeSession() else showMenu()
+    }
+
     private fun savePhoto(note: String, audio: ByteArray? = null) {
         val bytes = pendingPhoto ?: return
         try {
@@ -218,7 +216,6 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     if (isDestroyed) return@runOnUiThread
                     setStatus("手順 $number をアルバムに保存しました")
-                    if (!finishRequested && store.current() != null) showMenu() // 待機表示に切り替わる前に5秒見せる
                 }
             } catch (e: Exception) {
                 Log.e("StepMemoAlbum", "Album save failed", e)
@@ -277,7 +274,7 @@ class MainActivity : Activity() {
         }
         if (store.current() == null) { exitToHome(); return }
         finishRequested = true
-        showMenu(false)
+        showMenu()
         if (capturing) { setStatus("撮影後に終了します"); return }
         if (pendingPhoto != null) {
             setStatus("終了中: 写真とメモを保存")
@@ -292,7 +289,7 @@ class MainActivity : Activity() {
             store.finishSession()
             finishRequested = false
             setStatus("終了しました。ダブルタップで閉じる")
-            showMenu(false)
+            showMenu()
             Log.i("MemoryInput", "Session finished; exit=$exitAfterFinish")
             if (exitAfterFinish) exitToHome()
         } catch (e: Exception) {
@@ -308,19 +305,10 @@ class MainActivity : Activity() {
         finish()
     }
 
-    private fun showMenu(autoHide: Boolean = true) {
-        quietMode = false
-        hud.removeCallbacks(hideMenu)
-        if (autoHide && !capturing && pendingPhoto == null && store.current() != null) {
-            hud.postDelayed(hideMenu, 5000)
-        }
-        hud.invalidate()
-    }
+    private fun showMenu() = hud.invalidate()
 
     private fun setStatus(value: String) {
         status = value
-        if (isError(value))
-            showMenu(false)
         hud.invalidate()
     }
 
@@ -426,14 +414,34 @@ class MainActivity : Activity() {
             canvas.drawColor(Color.BLACK)
             val sx = width / 480f; val sy = height / 640f
             canvas.save(); canvas.scale(sx, sy)
-            if (quietMode && !capturing && pendingPhoto == null) {
-                line(canvas, "待機中：撮影はタップか「撮影」", 40f, 16f)
-                canvas.restore()
-                return
-            }
             val shown = preview
-            if (shown != null && pendingPhoto != null) drawPreview(canvas, shown) else drawRecord(canvas)
+            when {
+                shown != null && pendingPhoto != null -> drawPreview(canvas, shown)
+                capturing || pendingPhoto != null -> drawRecord(canvas)
+                else -> drawIdle(canvas)
+            }
             canvas.restore()
+        }
+
+        /** 待機画面（撮影していないときの基本の画面）。左上に操作の案内と、いまの出来事だけを出す。 */
+        private fun drawIdle(canvas: Canvas) {
+            val current = store.current()
+            if (current == null) {
+                line(canvas, "記録完了", 40f, 16f)
+                line(canvas, "前スワイプで新しい記録", 66f, 16f)
+                line(canvas, "ダブルタップで閉じる", 92f, 16f)
+            } else {
+                line(canvas, "「撮影」(タップ) ${current.getJSONArray("steps").length()}件を記録中", 40f, 16f)
+                line(canvas, "ダブルタップで終了", 66f, 16f)
+            }
+            val message = when {
+                finishRequested -> "記録を終了中"
+                isLoading() -> "音声認識を準備中…"
+                status.startsWith("手順 ") || isError(status) || status.startsWith("新しい記録") ||
+                    status.startsWith("記録を継続") || status.startsWith("写真を取り消し") -> status
+                else -> ""
+            }
+            if (message.isNotEmpty()) line(canvas, message.take(42), if (current == null) 128f else 102f, 16f)
         }
 
         private val photoPaint = Paint(Paint.FILTER_BITMAP_FLAG)
@@ -446,6 +454,7 @@ class MainActivity : Activity() {
             canvas.drawBitmap(photo, null, RectF(left, top, left + w, top + h), photoPaint)
             line(canvas, "撮影しました", top + h + 45f, 24f)
             line(canvas, "続けて手順の説明を話してください", top + h + 85f, 19f)
+            line(canvas, "やめるときは「キャンセル」", top + h + 120f, 18f)
         }
 
         /** 記録画面。タイトルは記録の状態、本文は今すること、操作の案内は1か所だけ。 */
@@ -468,6 +477,7 @@ class MainActivity : Activity() {
                     line(canvas, if (isLoading()) "マイク準備中..." else "手順の説明を話してください", 175f, 22f)
                     line(canvas, "話し終えたら「送信」", 212f, 19f)
                     line(canvas, "言い直すときは「やり直し」", 247f, 18f)
+                    line(canvas, "写真をやめるときは「キャンセル」", 279f, 18f)
                 }
             }
             // 操作の案内（ここだけに書く）
