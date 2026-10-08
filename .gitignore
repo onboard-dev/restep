@@ -23,3 +23,6 @@ phone/build/
 samples/*.wav
 
 docs/
+
+samples/stepmemo-test/glass-original.jpg
+samples/stepmemo-test/returned/
