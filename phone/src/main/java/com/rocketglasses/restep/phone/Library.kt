@@ -4,11 +4,15 @@ import android.util.AtomicFile
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 fun JSONArray.objects() = (0 until length()).map { getJSONObject(it) }
 fun JSONArray.strings() = (0 until length()).map { getString(it) }.toSet()
 
 class Library(private val root: File) {
+    companion object { const val SOURCE_ALBUM = "album" }
     private val disk = AtomicFile(File(root, "library.json"))
     var data: JSONObject = if (disk.baseFile.exists()) JSONObject(disk.openRead().use { it.readBytes().toString(Charsets.UTF_8) })
         else JSONObject().put("schemaVersion", 1).put("sessions", JSONArray())
@@ -16,6 +20,14 @@ class Library(private val root: File) {
     fun sessions() = data.getJSONArray("sessions").objects()
     fun deleted() = data.optJSONArray("deletedSessionIDs")?.strings() ?: emptySet()
     fun pending() = data.optJSONArray("pendingDeletionIDs")?.strings() ?: emptySet()
+    /** アルバムで調べ終えたファイル（「名前|大きさ|更新日時」）。次の取り込みで読み直さない。 */
+    fun scanned() = data.optJSONArray("scannedAlbumKeys")?.strings() ?: emptySet()
+    fun markScanned(keys: Collection<String>) {
+        if (keys.isEmpty()) return
+        commit(JSONObject(data.toString()).put("scannedAlbumKeys", JSONArray((scanned() + keys).toList())))
+    }
+    fun hasStep(sessionId: String, stepId: String) = sessions().firstOrNull { it.getString("id") == sessionId }
+        ?.getJSONArray("steps")?.objects()?.any { it.getString("id") == stepId } == true
     private fun commit(next: JSONObject) {
         root.mkdirs()
         val out = disk.startWrite()
@@ -27,10 +39,12 @@ class Library(private val root: File) {
         next.getJSONArray("sessions").objects().firstOrNull { it.getString("id") == id }?.let(change)
         commit(next)
     }
+    /** アルバムから取り込んだプロジェクトはグラスに削除を伝えない（グラスの旧同期とは別物）。 */
     fun delete(id: String) {
+        val fromAlbum = sessions().firstOrNull { it.getString("id") == id }?.optString("source") == SOURCE_ALBUM
         commit(JSONObject(data.toString()).put("sessions", JSONArray(sessions().filter { it.getString("id") != id }))
             .put("deletedSessionIDs", JSONArray((deleted() + id).toList()))
-            .put("pendingDeletionIDs", JSONArray((pending() + id).toList())))
+            .put("pendingDeletionIDs", JSONArray((if (fromAlbum) pending() else pending() + id).toList())))
         cleanup()
     }
     fun acknowledge(id: String) { commit(JSONObject(data.toString()).put("pendingDeletionIDs", JSONArray((pending() - id).toList()))) }
@@ -39,7 +53,7 @@ class Library(private val root: File) {
         return File(root, path)
     }
     fun audio(path: String): File {
-        require(path.matches(Regex("audio/[a-f0-9-]{36}/[a-f0-9-]{36}\\.wav"))) { "Invalid audio path" }
+        require(path.matches(Regex("audio/[a-f0-9-]{36}/[a-f0-9-]{36}\\.(wav|ogg)"))) { "Invalid audio path" }
         return File(root, path)
     }
     private fun write(target: File, bytes: ByteArray) {
@@ -49,6 +63,23 @@ class Library(private val root: File) {
     }
     fun storePhoto(path: String, bytes: ByteArray) = write(photo(path), bytes)
     fun storeAudio(path: String, bytes: ByteArray) = write(audio(path), bytes)
+    /** アルバムから取り込んだ1手順を加える（写真・音声は先に保存しておく）。手順は番号順に並べる。 */
+    fun addAlbumStep(sessionId: String, takenAt: Long, step: JSONObject) {
+        val next = JSONObject(data.toString())
+        val all = next.getJSONArray("sessions").objects().toMutableList()
+        val session = all.firstOrNull { it.getString("id") == sessionId } ?: JSONObject().apply {
+            put("id", sessionId)
+            put("name", "記録 " + SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.JAPAN).format(Date(takenAt)))
+            put("createdAt", takenAt)
+            put("source", SOURCE_ALBUM)
+            put("steps", JSONArray())
+        }.also { all.add(it) }
+        if (takenAt < session.getLong("createdAt")) session.put("createdAt", takenAt)
+        val steps = (session.getJSONArray("steps").objects() + step)
+            .sortedWith(compareBy<JSONObject>({ it.getInt("number") }, { it.optLong("createdAt") }))
+        session.put("steps", JSONArray(steps))
+        commit(next.put("sessions", JSONArray(all.sortedByDescending { it.getLong("createdAt") })))
+    }
     fun merge(remote: JSONObject) {
         require(remote.getInt("schemaVersion") == 1) { "Unsupported glasses library" }
         val all = sessions().associateBy { it.getString("id") }.toMutableMap()
@@ -73,6 +104,6 @@ class Library(private val root: File) {
         val used = steps.map { photo(it.getString("photo")).canonicalPath }.toSet()
         File(root,"photos").walkTopDown().filter { it.isFile && it.extension == "jpg" && it.canonicalPath !in used }.forEach { it.delete() }
         val usedAudio = steps.mapNotNull { it.optString("audio").takeIf { path -> path.isNotEmpty() } }.map { audio(it).canonicalPath }.toSet()
-        File(root,"audio").walkTopDown().filter { it.isFile && it.extension == "wav" && it.canonicalPath !in usedAudio }.forEach { it.delete() }
+        File(root,"audio").walkTopDown().filter { it.isFile && it.extension in setOf("wav", "ogg") && it.canonicalPath !in usedAudio }.forEach { it.delete() }
     }
 }

@@ -39,11 +39,13 @@ class TranscriptionSettings(context: Context) {
 
 /** 音声ファイルを文字に変える。OpenRouter 形式と、OpenAI 互換形式（/audio/transcriptions）の両方に対応。 */
 object Transcriber {
-    fun transcribe(settings: TranscriptionSettings, wav: File): String {
+    /** audio は WAV か、StepMemo の Opus 入り OGG（WAV に戻して送る）。 */
+    fun transcribe(settings: TranscriptionSettings, audio: File): String {
         require(settings.baseUrl.isNotBlank()) { "接続先の URL が未設定です" }
         require(settings.model.isNotBlank()) { "モデル名が未設定です" }
         if (settings.mode == TranscriptionSettings.MODE_OPENROUTER)
             require(settings.apiKey.isNotBlank()) { "OpenRouter の API キーが未設定です" }
+        val wav = AudioFiles.wavBytes(audio)
         val url = URL(settings.baseUrl.trimEnd('/') + "/audio/transcriptions")
         val connection = url.openConnection() as HttpURLConnection
         try {
@@ -55,7 +57,7 @@ object Transcriber {
             val body: ByteArray
             if (settings.mode == TranscriptionSettings.MODE_OPENROUTER) {
                 connection.setRequestProperty("Content-Type", "application/json")
-                val data = Base64.getEncoder().encodeToString(wav.readBytes())
+                val data = Base64.getEncoder().encodeToString(wav)
                 body = JSONObject().put("model", settings.model)
                     .put("input_audio", JSONObject().put("data", data).put("format", "wav"))
                     .put("language", "ja").toString().toByteArray(Charsets.UTF_8)
@@ -76,7 +78,7 @@ object Transcriber {
         }
     }
 
-    private fun multipart(boundary: String, wav: File, model: String): ByteArray {
+    private fun multipart(boundary: String, wav: ByteArray, model: String): ByteArray {
         val out = ByteArrayOutputStream()
         fun field(name: String, value: String) {
             out.write("--$boundary\r\nContent-Disposition: form-data; name=\"$name\"\r\n\r\n$value\r\n".toByteArray())
@@ -86,7 +88,7 @@ object Transcriber {
         field("response_format", "json")
         out.write(("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n" +
             "Content-Type: audio/wav\r\n\r\n").toByteArray())
-        out.write(wav.readBytes())
+        out.write(wav)
         out.write("\r\n--$boundary--\r\n".toByteArray())
         return out.toByteArray()
     }
