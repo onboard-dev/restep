@@ -5,9 +5,14 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.RectF
+import android.media.ExifInterface
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.SystemClock
@@ -20,6 +25,7 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.security.SecureRandom
 import java.io.File
+import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
     private lateinit var store: SessionStore
@@ -29,6 +35,13 @@ class MainActivity : Activity() {
     private lateinit var server: TransferServer
     private lateinit var directSync: DirectSync
     private var pendingPhoto: ByteArray? = null
+    private var pendingTakenAt = 0L
+    // 撮影直後に数秒だけ見せる写真（縮小版）。
+    private var preview: Bitmap? = null
+    private val endPreview = Runnable { preview?.recycle(); preview = null; hud.invalidate() }
+    private lateinit var album: StepMemoAlbum
+    // アルバムへの保存（音声の圧縮を含む）は順番に、画面を止めずに行う。
+    private val albumWriter = Executors.newSingleThreadExecutor()
     private var status = "準備完了"
     private var syncPage = false
     private var capturing = false
@@ -53,6 +66,7 @@ class MainActivity : Activity() {
         store = SessionStore(this)
         if (store.sessions().length() == 0) store.newSession()
         camera = PhotoCapture(this)
+        album = StepMemoAlbum(this)
         pairCode = getPreferences(MODE_PRIVATE).getString("pairCode", null) ?: run {
             val code = (100000 + SecureRandom().nextInt(900000)).toString()
             getPreferences(MODE_PRIVATE).edit().putString("pairCode", code).apply()
@@ -162,6 +176,9 @@ class MainActivity : Activity() {
         directSync.stop()
         server.stop()
         camera.close()
+        albumWriter.shutdown() // 書きかけの保存は最後まで続ける
+        hud.removeCallbacks(endPreview)
+        preview?.recycle(); preview = null
         super.onDestroy()
     }
 
@@ -215,6 +232,8 @@ class MainActivity : Activity() {
             capturing = false
             result.fold({ bytes ->
                 pendingPhoto = bytes
+                pendingTakenAt = System.currentTimeMillis()
+                showPreview(bytes)
                 if (!finishRequested) voice.expectNote()
                 voice.mute(false)
                 setStatus("LOADING")
@@ -234,15 +253,61 @@ class MainActivity : Activity() {
         val bytes = pendingPhoto ?: return
         try {
             val step = store.addStep(bytes, note, audio)
+            saveToAlbum(bytes, store.current()?.optString("id"), step, audio)
             pendingPhoto = null
+            hud.removeCallbacks(endPreview); endPreview.run()
             voice.cancelNote()
             voice.mute(false)
-            setStatus("手順 ${step.getInt("number")} を保存しました" + if (step.has("audio")) "（音声あり）" else "")
+            setStatus("手順 ${step.getInt("number")} を保存中…")
             if (finishRequested) completeSession() else showMenu()
         } catch (e: Exception) {
             finishRequested = false; exitAfterFinish = false
             setStatus("保存: ${e.message}")
         }
+    }
+
+    /** 写真に作業ID・手順番号・説明・音声を入れて DCIM/Camera に保存する（Hi Rokid の同期でスマホへ）。 */
+    private fun saveToAlbum(jpeg: ByteArray, sessionId: String?, step: org.json.JSONObject, audio: ByteArray?) {
+        if (sessionId.isNullOrEmpty()) return
+        val number = step.getInt("number")
+        val note = step.optString("note")
+        val takenAt = pendingTakenAt.takeIf { it > 0 } ?: System.currentTimeMillis()
+        albumWriter.execute {
+            try {
+                album.save(jpeg, sessionId, number, note, audio, takenAt)
+                runOnUiThread {
+                    if (isDestroyed) return@runOnUiThread
+                    setStatus("手順 $number をアルバムに保存しました")
+                    if (!finishRequested && store.current() != null) showMenu() // 待機表示に切り替わる前に5秒見せる
+                }
+            } catch (e: Exception) {
+                Log.e("StepMemoAlbum", "Album save failed", e)
+                runOnUiThread { if (!isDestroyed) setStatus("保存: アルバム ${e.message ?: "エラー"}") }
+            }
+        }
+    }
+
+    private fun showPreview(jpeg: ByteArray) {
+        hud.removeCallbacks(endPreview)
+        preview?.recycle()
+        preview = try { previewBitmap(jpeg) } catch (e: Exception) { Log.w("MemoryCamera", "Preview failed", e); null }
+        hud.postDelayed(endPreview, PREVIEW_MS)
+        hud.invalidate()
+    }
+
+    /** 1/4 に縮小して読み、EXIF の向きに合わせて回す。 */
+    private fun previewBitmap(jpeg: ByteArray): Bitmap? {
+        val bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, BitmapFactory.Options().apply { inSampleSize = 4 })
+            ?: return null
+        val degrees = when (ExifInterface(jpeg.inputStream()).getAttributeInt(ExifInterface.TAG_ORIENTATION, 0)) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+            ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+            ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+            else -> return bitmap
+        }
+        val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, Matrix().apply { postRotate(degrees) }, true)
+        if (rotated !== bitmap) bitmap.recycle()
+        return rotated
     }
 
     private fun newSession() {
@@ -465,7 +530,10 @@ class MainActivity : Activity() {
         count
     }
 
-    private companion object { const val NOTE_LINE = 22 } // 全角文字が読める大きさで1行に収まる文字数
+    private companion object {
+        const val NOTE_LINE = 22 // 全角文字が読める大きさで1行に収まる文字数
+        const val PREVIEW_MS = 3000L
+    }
 
     private inner class Hud : View(this@MainActivity) {
         // 日本語の字形で描く（指定しないと「写」などが中国語（簡体字）の字形になる）。
@@ -492,7 +560,8 @@ class MainActivity : Activity() {
                 canvas.restore()
                 return
             }
-            if (syncPage) drawSync(canvas) else drawRecord(canvas)
+            val shown = preview
+            if (syncPage) drawSync(canvas) else if (shown != null && pendingPhoto != null) drawPreview(canvas, shown) else drawRecord(canvas)
             canvas.restore()
         }
 
@@ -525,6 +594,18 @@ class MainActivity : Activity() {
             postInvalidateDelayed(700)
         }
 
+        private val photoPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+
+        /** 撮影直後のプレビュー。この間も説明の録音は始まっている。 */
+        private fun drawPreview(canvas: Canvas, photo: Bitmap) {
+            val scale = minOf(440f / photo.width, 440f / photo.height)
+            val w = photo.width * scale; val h = photo.height * scale
+            val left = (480f - w) / 2; val top = 30f
+            canvas.drawBitmap(photo, null, RectF(left, top, left + w, top + h), photoPaint)
+            line(canvas, "撮影しました", top + h + 45f, 24f)
+            line(canvas, "続けて手順の説明を話してください", top + h + 85f, 19f)
+        }
+
         /** 記録画面。タイトルは記録の状態、本文は今すること、操作の案内は1か所だけ。 */
         private fun drawRecord(canvas: Canvas) {
             val current = store.current()
@@ -553,9 +634,10 @@ class MainActivity : Activity() {
             line(canvas, "後スワイプ: スマホと同期", 374f, 18f)
             line(canvas, if (current == null) "ダブルタップ: 閉じる" else "ダブルタップ: 記録完了", 406f, 18f)
             val spokenNote = if (pendingPhoto != null) voice.currentDraft() else ""
-            if (spokenNote.isNotBlank()) {
+            if (pendingPhoto != null) {
+                // 説明の入力中は、今の手順のメモだけを出す（前回のメモが残っているように見えないように）。
                 line(canvas, "今のメモ:", 450f, 17f)
-                line(canvas, spokenNote.take(NOTE_LINE), 480f, 18f)
+                line(canvas, spokenNote.ifBlank { "（話した内容がここに出ます）" }.take(NOTE_LINE), 480f, 18f)
                 if (spokenNote.length > NOTE_LINE) line(canvas, spokenNote.drop(NOTE_LINE).take(NOTE_LINE), 508f, 18f)
             } else if (count > 0) {
                 val last = current!!.getJSONArray("steps").getJSONObject(count - 1).optString("note")

@@ -5,11 +5,11 @@ android {
     compileSdk { version = release(36) { minorApiLevel = 1 } }
     defaultConfig {
         applicationId = if (providers.gradleProperty("isolatedInputTest").isPresent)
-            "com.rocketglasses.soberyobratno.inputtest" else "com.rocketglasses.soberyobratno"
-        minSdk = 28
+            "com.rocketglasses.stepmemo.inputtest" else "com.rocketglasses.stepmemo"
+        minSdk = 29
         targetSdk = 33
-        versionCode = 19
-        versionName = "0.19-ja"
+        versionCode = 20
+        versionName = "0.20-stepmemo"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
     // StepMemo: グラスとスマホで共通のファイル形式の部品（ルートの shared/）
