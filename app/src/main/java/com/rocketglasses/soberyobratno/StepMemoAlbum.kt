@@ -55,6 +55,18 @@ internal class StepMemoAlbum(private val context: Context) {
         return name
     }
 
+    /**
+     * アルバムに保存できなかったときの控え。アプリのフォルダ（Android/data/…/files/unsaved）に
+     * 写真と音声をそのまま残す（adb で取り出せる。アルバムには出ない）。
+     */
+    fun keepUnsaved(jpeg: ByteArray, sessionId: String, step: Int, wav: ByteArray?, takenAt: Long): File {
+        val dir = File(context.getExternalFilesDir(null), "unsaved").apply { mkdirs() }
+        val base = "StepMemo-" + SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date(takenAt)) +
+            "-%02d-%s".format(Locale.US, step, sessionId.take(8))
+        wav?.let { File(dir, "$base.wav").writeBytes(it) }
+        return File(dir, "$base.jpg").apply { writeBytes(jpeg) }
+    }
+
     /** Opus に圧縮する。端末で圧縮できないときは WAV のまま入れる（音声を失わないため）。 */
     private fun compress(wav: ByteArray): Pair<String, ByteArray> = try {
         OpusEncoder.FORMAT to OpusEncoder.encode(wav.copyOfRange(WAV_HEADER, wav.size), context.cacheDir)

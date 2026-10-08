@@ -19,7 +19,6 @@ class Library(private val root: File) {
         private set
     fun sessions() = data.getJSONArray("sessions").objects()
     fun deleted() = data.optJSONArray("deletedSessionIDs")?.strings() ?: emptySet()
-    fun pending() = data.optJSONArray("pendingDeletionIDs")?.strings() ?: emptySet()
     /** アルバムで調べ終えたファイル（「名前|大きさ|更新日時」）。次の取り込みで読み直さない。 */
     fun scanned() = data.optJSONArray("scannedAlbumKeys")?.strings() ?: emptySet()
     fun markScanned(keys: Collection<String>) {
@@ -39,15 +38,13 @@ class Library(private val root: File) {
         next.getJSONArray("sessions").objects().firstOrNull { it.getString("id") == id }?.let(change)
         commit(next)
     }
-    /** アルバムから取り込んだプロジェクトはグラスに削除を伝えない（グラスの旧同期とは別物）。 */
+    /** 削除したプロジェクトの ID は覚えておき、アルバムから取り込み直さない。 */
     fun delete(id: String) {
-        val fromAlbum = sessions().firstOrNull { it.getString("id") == id }?.optString("source") == SOURCE_ALBUM
         commit(JSONObject(data.toString()).put("sessions", JSONArray(sessions().filter { it.getString("id") != id }))
             .put("deletedSessionIDs", JSONArray((deleted() + id).toList()))
-            .put("pendingDeletionIDs", JSONArray((if (fromAlbum) pending() else pending() + id).toList())))
+            .apply { remove("pendingDeletionIDs") }) // 旧同期でグラスに伝える予定だった削除（もう使わない）
         cleanup()
     }
-    fun acknowledge(id: String) { commit(JSONObject(data.toString()).put("pendingDeletionIDs", JSONArray((pending() - id).toList()))) }
     fun photo(path: String): File {
         require(path.matches(Regex("photos/[a-f0-9-]{36}/[a-f0-9-]{36}\\.jpg"))) { "Invalid photo path" }
         return File(root, path)
@@ -79,25 +76,6 @@ class Library(private val root: File) {
             .sortedWith(compareBy<JSONObject>({ it.getInt("number") }, { it.optLong("createdAt") }))
         session.put("steps", JSONArray(steps))
         commit(next.put("sessions", JSONArray(all.sortedByDescending { it.getLong("createdAt") })))
-    }
-    fun merge(remote: JSONObject) {
-        require(remote.getInt("schemaVersion") == 1) { "Unsupported glasses library" }
-        val all = sessions().associateBy { it.getString("id") }.toMutableMap()
-        for (incoming in remote.getJSONArray("sessions").objects()) {
-            val id = incoming.getString("id"); if(id in deleted()) continue
-            val old = all[id]
-            if (old != null) {
-                incoming.put("name", old.getString("name"))
-                val steps = old.getJSONArray("steps").objects().associateBy { it.getString("id") }
-                for(step in incoming.getJSONArray("steps").objects()) steps[step.getString("id")]?.let {
-                    step.put("note", it.getString("note")).put("completed", it.optBoolean("completed"))
-                    if (it.has("transcribed")) step.put("transcribed", it.getBoolean("transcribed"))
-                }
-            }
-            all[id] = incoming
-        }
-        commit(JSONObject(data.toString()).put("sessions", JSONArray(all.values.sortedByDescending { it.getLong("createdAt") })))
-        cleanup()
     }
     private fun cleanup() {
         val steps = sessions().flatMap { it.getJSONArray("steps").objects() }

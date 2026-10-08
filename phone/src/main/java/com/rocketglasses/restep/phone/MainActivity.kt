@@ -10,7 +10,6 @@ import android.content.pm.PackageManager
 import android.media.MediaPlayer
 import android.provider.MediaStore
 import android.graphics.*
-import android.net.Network
 import android.view.View
 import android.widget.*
 import org.json.JSONObject
@@ -23,18 +22,16 @@ import java.util.concurrent.Executors
 class MainActivity: Activity() {
     companion object {
         private var sharedLibrary: Library? = null
-        private var syncing = false
         private var importing = false
         private var visible: java.lang.ref.WeakReference<MainActivity>? = null
     }
     private lateinit var library: Library
-    private lateinit var link: GlassesLink
     private lateinit var body: LinearLayout
     private lateinit var message: TextView
     private val worker = Executors.newSingleThreadExecutor()
     private lateinit var settings: TranscriptionSettings
     private var transcribing = false
-    private val busy get() = syncing || transcribing || importing
+    private val busy get() = transcribing || importing
     private var selected: String? = null
     private var assembly = true
     private var player: MediaPlayer? = null
@@ -46,7 +43,6 @@ class MainActivity: Activity() {
         window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
         library = sharedLibrary ?: Library(filesDir).also { sharedLibrary = it }
         settings = TranscriptionSettings(this)
-        link = GlassesLink(this, { text -> message.text = text }, { network, info -> sync(network, info.getString("host"),info.getString("token")) })
         render()
     }
     override fun onResume() { super.onResume(); visible = java.lang.ref.WeakReference(this); render() }
@@ -61,7 +57,7 @@ class MainActivity: Activity() {
         }
         setContentView(scroll)
         body.addView(label("StepMemo",34f))
-        message = label(if(syncing) "同期中…" else if(transcribing) "文字起こし中…" else if(importing) "取り込み中…" else "グラスで記録した手順を見ます")
+        message = label(if(transcribing) "文字起こし中…" else if(importing) "取り込み中…" else "グラスで記録した手順を見ます")
         body.addView(message)
         val session = library.sessions().firstOrNull { it.getString("id") == selected }
         if(session == null) showLibrary() else showSession(session)
@@ -71,11 +67,6 @@ class MainActivity: Activity() {
         body.addView(label("先に Hi Rokid アプリでグラスのアルバムを同期してください。スマホの「Download/Hi Rokid」から StepMemo の写真を探して取り込みます（元の写真はそのまま）。",14f))
         body.addView(button("フォルダを選んで取り込む") { pickFolder() })
         body.addView(button("文字起こしの設定") { transcriptionSettings() })
-        body.addView(label("旧方式: グラスと直接同期",18f))
-        body.addView(button("同期") { connect() })
-        body.addView(label("グラスで旧 ReStep を開き、後ろへスワイプして同期画面にしてください。転送中はこの画面を開いたままにします。",14f))
-        body.addView(button("手動で接続（IPアドレス）") { manual() })
-        if(library.pending().isNotEmpty()) body.addView(label("グラスへの削除反映が${library.pending().size}件、同期待ちです。"))
         body.addView(label("プロジェクト",24f))
         if(library.sessions().isEmpty()) body.addView(label("取り込むと、記録がここに表示されます。"))
         for(session in library.sessions()) {
@@ -90,8 +81,7 @@ class MainActivity: Activity() {
         val fromAlbum = session.optString("source") == Library.SOURCE_ALBUM
         body.addView(label(when {
             fromAlbum -> "グラスのアルバムから取り込み（同じ作業の写真を取り込むと、ここに追加されます）"
-            session.has("endedAt") -> "グラスでの記録: 完了"
-            else -> "グラスでの記録: 記録中（まだ終了していません）"
+            else -> "旧方式（グラスと直接同期）で取り込んだ記録"
         }, 14f))
         body.addView(button("プロジェクト名を変更") { editText("プロジェクト名", session.getString("name")) { text -> library.edit(id) { it.put("name",text) }; render() } })
         body.addView(button(if(assembly) "組み立て順（逆順）で表示中 ・ 分解順に切り替え" else "分解順で表示中 ・ 組み立て順（逆順）に切り替え") { assembly = !assembly; render() })
@@ -131,7 +121,7 @@ class MainActivity: Activity() {
         body.addView(button("プロジェクトを削除") {
             AlertDialog.Builder(this).setTitle("このプロジェクトを削除しますか？").setMessage(
                 if(fromAlbum) "このアプリの中の写真とメモを削除します。アルバムの元の写真は残り、次の取り込みでも取り込み直しません。"
-                else "写真とメモはこのスマホから今すぐ、グラスからは次の同期で削除されます。")
+                else "このアプリの中の写真とメモを削除します。")
                 .setNegativeButton("キャンセル",null).setPositiveButton("削除") { _,_ ->
                     runCatching { library.delete(id); selected = null; render() }.onFailure { message.text = it.message }
                 }.show()
@@ -339,81 +329,10 @@ class MainActivity: Activity() {
             runCatching { save(input.text.toString()) }.onFailure { message.text = it.message }
         }.show()
     }
-    private fun permissions(): Array<String> = buildList {
-        add(Manifest.permission.ACCESS_FINE_LOCATION); add(Manifest.permission.ACCESS_COARSE_LOCATION)
-        if(Build.VERSION.SDK_INT >= 31) { add(Manifest.permission.BLUETOOTH_SCAN); add(Manifest.permission.BLUETOOTH_CONNECT) }
-        if(Build.VERSION.SDK_INT >= 33) add(Manifest.permission.NEARBY_WIFI_DEVICES)
-    }.toTypedArray()
-    private fun connect() {
-        val missing = permissions().filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-        if(missing.isNotEmpty()) { requestPermissions(permissions(),42); return }
-        runCatching { link.start() }.onFailure { message.text = it.message }
-    }
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grants: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grants)
-        if(requestCode == 43) { importAlbum(asked = true); return }
-        if(requestCode == 42) {
-            if(grants.isNotEmpty() && grants.all { it == PackageManager.PERMISSION_GRANTED }) connect()
-            else message.text = "接続には「付近のデバイス」と位置情報の許可が必要です。「手動で接続」も使えます。"
-        }
-    }
-    private fun manual() {
-        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24,12,24,12) }
-        box.addView(label("方法A（Wi-Fi Direct）: スマホの Wi-Fi 設定で、グラスに表示された「Wi-Fi名」に表示の「パスワード」でつなぎます。\n方法B: スマホとグラスを同じ Wi-Fi につなぎます。\nどちらも、グラスに表示された IP とコードを下に入力してください。",14f))
-        val lastHost = getPreferences(MODE_PRIVATE).getString("lastHost", "192.168.49.1")!!.split('.')
-        val fields = (0..3).map { i -> EditText(this).apply { hint = "0"; setText(lastHost.getOrNull(i) ?: ""); inputType = android.text.InputType.TYPE_CLASS_NUMBER; filters = arrayOf(android.text.InputFilter.LengthFilter(3)) } }
-        val row = LinearLayout(this)
-        fields.forEachIndexed { index, field -> row.addView(field,LinearLayout.LayoutParams(0,-2,1f)); if(index < 3) row.addView(label(".")) }
-        box.addView(row)
-        val code = EditText(this).apply {
-            hint = "ペアコード（6桁）"; inputType = android.text.InputType.TYPE_CLASS_NUMBER
-            setText(getPreferences(MODE_PRIVATE).getString("lastCode", "") ?: "")   // 前回のコードを覚えておく
-        }
-        box.addView(code)
-        val dialog = AlertDialog.Builder(this).setTitle("手動で同期").setView(box).setNegativeButton("キャンセル",null).setPositiveButton("同期",null).create()
-        dialog.setOnShowListener { dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-            val parts = fields.map { it.text.toString().toIntOrNull() ?: -1 }
-            if(parts.any { it !in 0..255 } || !code.text.matches(Regex("[0-9]{6}"))) { code.error = "IPアドレス（0〜255の4つの数字）と6桁のコードを入力してください" }
-            else {
-                dialog.dismiss(); link.stop()
-                val host = parts.joinToString(".")
-                getPreferences(MODE_PRIVATE).edit().putString("lastHost", host).putString("lastCode", code.text.toString()).apply()
-                sync(link.wifiNetworkFor(host),host,code.text.toString())
-            }
-        } }; dialog.show()
-    }
-    private fun sync(network: Network?, host: String, token: String) {
-        if(busy) return
-        syncing = true; render()
-        worker.execute {
-            val result = runCatching {
-                for(id in library.pending()) { GlassesLink.request(network,host,token,"/session/$id","DELETE"); library.acknowledge(id) }
-                val remote = JSONObject(GlassesLink.request(network,host,token,"/manifest").toString(Charsets.UTF_8))
-                require(remote.getInt("schemaVersion") == 1)
-                for(session in remote.getJSONArray("sessions").objects()) {
-                    if(session.getString("id") in library.deleted()) continue
-                    for(step in session.getJSONArray("steps").objects()) {
-                        val path = step.getString("photo")
-                        if(!library.photo(path).exists()) library.storePhoto(path,GlassesLink.request(network,host,token,"/photo/$path"))
-                        // 音声は付属データ。取得に失敗しても同期全体は止めず、次回の同期でやり直す。
-                        val audioPath = step.optString("audio")
-                        if(audioPath.isNotEmpty() && !library.audio(audioPath).exists())
-                            runCatching { library.storeAudio(audioPath,GlassesLink.request(network,host,token,"/audio/$audioPath")) }
-                    }
-                }
-                library.merge(remote)
-                // 保存できた手順をグラスに知らせる（グラスの「未同期の手順」の数に使う）。失敗しても同期は成功扱い。
-                val ids = remote.getJSONArray("sessions").objects().flatMap { it.getJSONArray("steps").objects().map { step -> step.getString("id") } }
-                if(ids.isNotEmpty()) runCatching { GlassesLink.request(network,host,token,"/synced?ids=" + ids.joinToString(",")) }
-            }
-            runOnUiThread {
-                link.stop(); syncing = false
-                visible?.get()?.takeIf { !it.isDestroyed }?.let { screen ->
-                    screen.render(); screen.message.text = result.fold({ "同期が完了しました。${library.sessions().size}件のプロジェクトをこのスマホに保存しています。" },{ it.message ?: "同期に失敗しました。もう一度お試しください。" })
-                }
-            }
-        }
+        if(requestCode == 43) importAlbum(asked = true)
     }
     override fun onPause() { stopPlayback(); super.onPause() }
-    override fun onDestroy() { stopPlayback(); link.stop(); worker.shutdown(); super.onDestroy() }
+    override fun onDestroy() { stopPlayback(); worker.shutdown(); super.onDestroy() }
 }
